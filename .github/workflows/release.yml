@@ -1,0 +1,77 @@
+name: Release
+# The binaries for a tag, attached to its GitHub release, so ship can be put on
+# a machine with one download instead of a `cargo install`:
+#
+#   curl -fsSL https://github.com/diaryx-org/ship/releases/latest/download/ship-x86_64-unknown-linux-musl.tar.gz | tar -xz -C ~/.local/bin
+#
+# Asset names carry no version, so `latest/download` always finds them. The
+# release's body is ship's to write (`ship github`, the last step of `ship
+# <spec> --push`): whichever of the two gets there first creates the release,
+# and the other fills in its part.
+on:
+  push: { tags: ['v*'] }
+  workflow_dispatch:
+    inputs:
+      tag: { description: "the tag to build and attach binaries to", required: true }
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        # Linux on musl: static, so it runs in any container whatever its libc.
+        - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+        - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+        - { target: x86_64-apple-darwin, os: macos-latest }
+        - { target: aarch64-apple-darwin, os: macos-latest }
+    steps:
+    - uses: actions/checkout@v4
+      with: { ref: "${{ env.TAG }}" }
+    - uses: dtolnay/rust-toolchain@stable
+      with: { targets: "${{ matrix.target }}" }
+    - run: cargo build --release --locked --target ${{ matrix.target }}
+    - name: Package
+      run: |
+        dir="$RUNNER_TEMP/ship"
+        mkdir -p "$dir" dist
+        cp target/${{ matrix.target }}/release/ship README.md LICENSE-MIT LICENSE-APACHE "$dir"/
+        strip "$dir/ship" || true
+        # `ship` at the archive's root, so `tar -xz -C <bin dir>` installs it.
+        tar -czf dist/ship-${{ matrix.target }}.tar.gz -C "$dir" ship README.md LICENSE-MIT LICENSE-APACHE
+        (cd dist && shasum -a 256 ship-${{ matrix.target }}.tar.gz > ship-${{ matrix.target }}.tar.gz.sha256)
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ship-${{ matrix.target }}
+        path: dist/*
+
+  publish:
+    name: Attach to the release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+    - uses: actions/download-artifact@v4
+      with: { path: dist, merge-multiple: true }
+    - name: Upload
+      run: |
+        # ship usually writes the release before the builds finish; where it
+        # has not, make an empty one for `ship github` to fill in. A create
+        # that loses that race is fine as long as the release now exists.
+        if ! gh release view "$TAG" --json tagName >/dev/null 2>&1; then
+          pre=false; case "$TAG" in *-*) pre=true ;; esac
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes "" --prerelease="$pre" \
+            || gh release view "$TAG" --json tagName >/dev/null
+        fi
+        gh release upload "$TAG" dist/* --clobber

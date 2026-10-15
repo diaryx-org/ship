@@ -5,6 +5,12 @@ url = https://github.com/diaryx-org/ship
 # Nothing goes to crates.io: ship is consumed from git, and the name is taken.
 publishes = false
 
+# What pushing the tag sets off, named in the warning before the push.
+tag_starts
+> *
+> > workflow = release.yml
+> > does = builds ship for Linux and macOS and attaches the binaries to the GitHub release
+
 # CI: `.github/workflows/ci.yml` runs each job on a runner of its own, building
 # ship from this checkout to read the list — the one repository that cannot
 # install ship to run its CI.
