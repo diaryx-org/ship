@@ -1,0 +1,43 @@
+name: CI
+# The jobs are the `job` list in .config/ship.figl. Elsewhere a workflow installs
+# ship to read it; here ship is the checkout, so it is built from source and run
+# with `cargo run`.
+on:
+  push: { branches: [main] }
+  pull_request: null
+  workflow_dispatch: null
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      jobs: ${{ steps.plan.outputs.jobs }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - id: plan
+      run: echo "jobs=$(cargo run --quiet --locked -- ci --matrix)" >> "$GITHUB_OUTPUT"
+
+  run:
+    name: ${{ matrix.job.name }}
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.plan.outputs.jobs) }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with: { components: "${{ matrix.job.components }}" }
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo run --quiet --locked -- ci ${{ matrix.job.id }}

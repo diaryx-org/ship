@@ -1,0 +1,154 @@
+# git-cliff, for every repository ship releases that does not name its own.
+#
+# One file, one style, carried inside ship rather than copied into each
+# repository. A repository whose own tooling has to read the file from inside its
+# checkout keeps a copy, names it as `cliff_config` in .config/ship.figl, and
+# differs only where its own comment says so.
+#
+# The consumer is a program rather than a person: ship regenerates the region
+# between the `git-cliff:begin`/`git-cliff:end` markers inside a changelog's
+# `## Unreleased` section, renders that region once more under the version being
+# cut, and moves it down. So the template below is written for a changelog bullet
+# and nothing else.
+#
+# The **Behavioural changes** section is generated too, from `Behavioural-change:`
+# trailers rather than from subjects. The question it answers — would a caller who
+# upgrades without editing a line of their own code observe a difference — is a
+# judgment about the change, and no subject can carry it: a `fix:` can be
+# behavioural and an `add:` can be silently behavioural. Asking the author for a
+# trailer keeps that judgment where it has to be made, at the commit, by the
+# person holding the context, and ends the duplication of writing it a second time
+# by hand where it could drift or be forgotten.
+#
+# One trailer per observable difference; a commit may carry several. Write the
+# value as prose a consumer can act on: what used to happen, what happens now.
+# Continuation lines are indented two spaces and fold into one paragraph.
+#
+#     Behavioural-change: `Doc::visual_map` no longer emits a run for an empty
+#       trailing line. It used to emit one of zero width; a renderer that keyed
+#       off run count will see one fewer.
+#
+# Still handwritten, and deliberately: a release INTRO, for a release that wants a
+# narrative rather than a list. It goes below the end marker, where regeneration
+# cannot reach it.
+
+[changelog]
+header = ""
+footer = ""
+trim = true
+
+# One `### Group` per bucket, commits as bullets, scope in bold where a subject
+# carries one — every repository leans on scope to say which surface moved. The
+# short hash makes a bullet traceable back to the diff during triage, and the
+# repository it links into comes from the git origin, which is what lets one
+# template serve them all.
+#
+# Then one **Behavioural changes** section for the whole release, gathered from
+# every trailer in commit order. It comes last because it is what a consumer
+# upgrading reads first-and-only: the groups above say what moved, this says what
+# will break under them. Gathered into a list before rendering, so the heading
+# appears only when there is something under it.
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}** — {% endif %}{{ commit.message }} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/commit/{{ commit.id }}))
+{%- endfor %}
+{% endfor %}
+{%- set_global notes = [] -%}
+{%- for commit in commits -%}
+{#- `default`, because a commit git-conventional could not parse carries no
+    `footers` key at all rather than an empty one, and an unguarded access aborts
+    the whole render. -#}
+{%- for f in commit.footers | default(value=[]) | filter(attribute="token", value="Behavioural-change") -%}
+{%- set_global notes = notes | concat(with=f.value) -%}
+{%- endfor -%}
+{%- endfor -%}
+{% if notes | length > 0 %}
+### Behavioural changes
+{% for n in notes %}
+- {{ n | trim }}
+{% endfor %}
+{%- endif %}"""
+
+[git]
+conventional_commits = true
+# Unconventional commits are kept rather than dropped, so the catch-all parser at
+# the bottom surfaces them for triage instead of losing them silently.
+filter_unconventional = false
+filter_commits = false
+protect_breaking_commits = true
+split_commits = false
+sort_commits = "oldest"
+# Anchored, because this is a regex and not a glob: unanchored, `v[0-9]*` matches
+# every tag with a `v` anywhere in it — `archive/tauri-web-1.6.1` and
+# `diaryx.sync/v0.2.11` alike — and the unreleased range then starts from
+# whichever of those came last. Anchored, it is exactly the set ship walks
+# with `git tag --list "v[0-9]*"`.
+tag_pattern = '^v[0-9]'
+
+commit_preprocessors = [
+  # The house convention is often spelled with the colon dropped — `add(editor) a
+  # second pane, and the split that keeps it honest`. git-conventional reads that
+  # as unparseable, and an unparseable subject costs far more than a bucket:
+  # git-cliff then has no idea where the subject ends, so the ENTIRE commit body
+  # lands in the bullet and the `Behavioural-change:` trailers below it are never
+  # seen as trailers at all. Putting the colon back before parsing rescues the
+  # whole history rather than only what is committed from here on. The type list
+  # is closed on purpose: a subject opening with any other word is off-convention
+  # and belongs in triage, not silently promoted into `Added`.
+  { pattern = '^(?P<type>add|feat|fix|remove|change|move|refactor|perf|polish|docs|chore|test|ci|build|style)(?P<scope>\([^)\n]*\))?(?P<bang>!)?[ \t]+(?P<rest>[^\s:])', replace = "${type}${scope}${bang}: ${rest}" },
+  # A subject with no type at all. Every one of these repositories has a stretch
+  # of them, written before the convention arrived — `Decide what forgetting means
+  # under sync` — and they fail the same expensive way. So give them a type they
+  # do not have: `legacy` parses, which is the whole point — the subject ends at
+  # the first line, the body stops being the bullet, and the trailers are read.
+  # The parser below routes `legacy` to triage, so nothing is hidden.
+  #
+  # The test is the leading capital, and that is not a coincidence: a conventional
+  # subject opens with its lowercase type. One written off-convention starting
+  # lowercase still reaches triage, by the catch-all parser instead.
+  { pattern = '^(?P<subject>[A-Z][^\n]*)', replace = "legacy: ${subject}" },
+  # A trailing period on a SUBJECT reads wrong once it is a bullet. Anchored to
+  # the first line, because a preprocessor sees the whole message: an
+  # end-of-STRING anchor leaves the subject alone on any multi-line commit and
+  # quietly eats the last period of the body — which is where the trailers live,
+  # so it truncates the last sentence a consumer reads.
+  { pattern = '^(?P<subject>[^\n]*?)[ \t]*\.[ \t]*(?P<rest>\n|$)', replace = "${subject}${rest}" },
+  # A bare `<div>` is HTML once the bullet is rendered, and the word disappears.
+  # Backtick anything angle-bracketed that isn't already — where "already" has to
+  # mean the whole line, not the character in front, or the rule fires inside an
+  # existing code span and produces nested backticks that render as nothing anyone
+  # meant. So the match may begin only at a line start and may not cross a
+  # backtick to reach the `<`. The cost is that only the first bare tag on such a
+  # line is caught; write the second in backticks, which is what it wanted anyway.
+  { pattern = '(?m)^(?P<pre>[^`\n]*?)<(?P<tag>[a-zA-Z/][^<>\s]*)>', replace = "${pre}`<${tag}>`" },
+]
+
+# First match wins, so the `!` breaking rule has to precede the type rules.
+#
+# The house convention spells an addition `add(scope):` rather than `feat(scope):`
+# and a revision `change`, `move`, or `polish` alongside `refactor`; all of them
+# are accepted, so muscle memory from any of these repos lands in the right bucket
+# rather than in triage.
+commit_parsers = [
+  { message = '^chore\(release\)', skip = true },
+  { message = '^chore: (release|bump)', skip = true },
+  { message = '^[a-zA-Z]+(\(.+\))?!:', group = "<0>Breaking" },
+  { message = '^(add|feat)', group = "<1>Added" },
+  { message = '^fix', group = "<2>Fixed" },
+  { message = '^(refactor|perf|polish|move|change)', group = "<3>Changed" },
+  { message = '^remove', group = "<4>Removed" },
+  { message = '^docs', skip = true },
+  { message = '^(chore|test|ci|build|style)', skip = true },
+  # A merge git wrote itself, and nothing else — the `legacy: ` prefix is the one
+  # the preprocessor above adds. Spelled out rather than a loose `^[Mm]erge`,
+  # which would also swallow `Merge two lines of work, and record the resolution`:
+  # a commit that did the work, not one that recorded a branch. A `merge:` written
+  # as though it were a type is not skipped either, and lands in triage — where it
+  # is visible, and where its trailers are still read, which a skip would drop.
+  { message = '^(legacy: )?[Mm]erge (branch|pull request|remote-tracking)', skip = true },
+  # Everything else is off-convention, `legacy:` included. It gets a visible
+  # bucket rather than a silent drop, so the author decides where it belongs.
+  { message = '.*', group = "<9>Uncategorised — triage before release" },
+]

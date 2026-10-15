@@ -1,0 +1,28 @@
+# ship releases itself, and runs its own CI, from this file.
+name = ship
+url = https://github.com/diaryx-org/ship
+
+# Nothing goes to crates.io: ship is consumed from git, and the name is taken.
+publishes = false
+
+# CI: `.github/workflows/ci.yml` runs each job on a runner of its own, building
+# ship from this checkout to read the list — the one repository that cannot
+# install ship to run its CI.
+job
+> *
+> > id = fmt
+> > name = Format
+> > run = cargo fmt --check
+> > runner
+> > > components = rustfmt
+> > > builds = false
+> *
+> > id = clippy
+> > name = Clippy
+> > run = cargo clippy --all-targets -- -D warnings
+> > runner
+> > > components = clippy
+> *
+> > id = test
+> > name = Test
+> > run = cargo test
