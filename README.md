@@ -108,6 +108,19 @@ the job runs. See `.github/workflows/ci.yml` here for the shape.
 
 ## Installing
 
+Every release carries binaries for Linux (static, musl) and macOS, x86_64 and
+aarch64, under names without a version, so the latest is always one download:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/diaryx-org/ship/releases/latest/download/ship-x86_64-unknown-linux-musl.tar.gz \
+  | tar -xz -C ~/.local/bin ship
+```
+
+The others are `ship-aarch64-unknown-linux-musl`, `ship-x86_64-apple-darwin`
+and `ship-aarch64-apple-darwin`, each with a `.sha256` beside it. Or from
+source:
+
 ```sh
 cargo install --locked --git https://github.com/diaryx-org/ship ship
 ```
