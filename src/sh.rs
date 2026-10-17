@@ -196,9 +196,15 @@ impl Sh {
     /// progress is the thing someone is watching, and its failure is the thing
     /// they need to read.
     pub fn shell(&self, command: &str) -> Result<()> {
+        self.shell_env(command, &[])
+    }
+
+    /// The same, with variables set for it.
+    pub fn shell_env(&self, command: &str, envs: &[(&str, &str)]) -> Result<()> {
         println!("{}", self.dim(&format!("$ {}", command.trim_end())));
         let status = Command::new("bash")
             .args(["-eo", "pipefail", "-c", command])
+            .envs(envs.iter().copied())
             .current_dir(&self.root)
             .status()
             .map_err(|e| format!("could not run bash: {e}"))?;
@@ -271,7 +277,7 @@ fn color() -> bool {
     std::io::stdout().is_terminal()
 }
 
-fn exit(status: &std::process::ExitStatus) -> String {
+pub fn exit(status: &std::process::ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("exit {code}"),
         None => "killed by a signal".to_string(),

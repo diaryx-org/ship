@@ -10,7 +10,7 @@ ship bump [<spec>]      move the version in every manifest that carries it
 ship changelog          the unreleased region (--write splices it, --check verifies it)
 ship notes [tag]        a release's changelog section, as the GitHub release body
 ship github [tag]       write that section to the GitHub release
-ship ci [<job>]         run the CI jobs, or one of them (--list, --matrix)
+ship ci [<job>]         run the CI jobs, or one of them (--parallel, --list, --matrix)
 ```
 
 `<spec>` is `patch`, `minor`, `major`, an explicit `x.y.z[-pre]`, or `as-is`
@@ -58,12 +58,13 @@ url = https://github.com/diaryx-org/fig-lua
 | `changelog_since` | none | the earliest tag the changelog claims to cover |
 | `cliff_config` | ship's own | a git-cliff config of the repository's own |
 | `release_branch` | `main` | |
-| `verify` | the `job` list | what to run before cutting; `cargo xtask ci` where there are no jobs |
+| `verify` | the `job` list | what to run before cutting, as `ship ci` runs it; `cargo xtask ci` where there are no jobs |
 | `verify_after_bump` | `false` | true where `verify` checks the versions being written |
 | `publishes` | `true` | whether preflight asks crates.io if the version is spent |
 | `push_tag_first` | `false` | for a system that builds the tag and will not build one commit twice |
 | `allow_empty_release` | `true` | |
 | `tag_starts` | `[]` | what pushing the tag sets off, for the warning before the push |
+| `ci_parallel` | `false` | `ship ci` runs every job at once, as `--parallel` |
 
 A repository from before ship keeps `.config/release.toml` and
 `.config/ci.toml`, and ship reads those where there is no `ship.figl`.
@@ -97,6 +98,24 @@ job
 clippy` runs one. Each runs under `bash -eo pipefail -c` at the repository
 root, which is the shell GitHub gives a `run:` step, so a job means the same
 thing on your machine and on a runner.
+
+Three fields say where and when a job runs, and these are ship's:
+
+| field | default | |
+|---|---|---|
+| `local` | `true` | false leaves it out of `ship ci` unless it is named: a job too slow for every run here, which a runner can afford |
+| `matrix` | `true` | false leaves it out of `--matrix`: a job only a developer's machine can run |
+| `after` | none | an earlier job this one waits for when the jobs run at once |
+
+`ship ci --parallel`, or `ci_parallel = true`, starts every job at once, each
+under its own process group with its output in `<git dir>/ship/ci/<id>.log`,
+and a job with `after` once that job has passed. A job whose `after` has
+passed in the same run, at once or in order, finds its id in `SHIP_CI_AFTER`,
+so it can trust what that job left behind; named alone, it finds nothing. The first to fail stops the
+rest and prints the end of its log. It is for a list whose jobs spend their
+time anywhere but one shared lock — a prover, a simulator, test binaries — so
+the whole list takes as long as its longest job. Where there is no `verify`,
+the release runs the job list the same way.
 
 A workflow asks `ship ci --matrix` for the jobs, as one line of JSON, and runs
 each on a runner of its own as `ship ci <id>`, named `CI / <name>`. A job's
