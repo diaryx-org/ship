@@ -53,6 +53,7 @@ struct Stated {
     push_tag_first: Option<bool>,
     allow_empty_release: Option<bool>,
     tag_starts: Option<Vec<TagStart>>,
+    ci_parallel: Option<bool>,
     job: Option<Vec<Job>>,
 }
 
@@ -67,17 +68,33 @@ pub struct TagStart {
     pub does: Option<String>,
 }
 
-/// One CI job. `id`, `name` and `run` are the whole of what ship reads;
-/// `runner` is the workflow's alone, passed through to the matrix — see
-/// `ci.rs`.
+/// One CI job. `id`, `name` and `run` are what it is; `local`, `matrix` and
+/// `after` are where and when ship runs it; `runner` is the workflow's alone,
+/// passed through to the matrix — see `ci.rs`.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub id: String,
     pub name: String,
     pub run: String,
+    /// Whether `ship ci` with no job named runs it. False for a job too slow
+    /// for every local run, which a runner can afford.
+    #[serde(default = "yes")]
+    pub local: bool,
+    /// Whether `--matrix` lists it. False for a job only a developer's
+    /// machine can run, which no runner has.
+    #[serde(default = "yes")]
+    pub matrix: bool,
+    /// An earlier job this one starts after, when the jobs run at once. In
+    /// order, the list already says so.
+    #[serde(default)]
+    pub after: Option<String>,
     #[serde(default)]
     pub runner: BTreeMap<String, fig::Value>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The settings, every default filled in.
@@ -126,6 +143,9 @@ pub struct Config {
     pub push_tag_first: bool,
     pub allow_empty_release: bool,
     pub tag_starts: Vec<TagStart>,
+    /// Whether `ship ci` runs its jobs at once, each into a log of its own,
+    /// rather than in order with their output streaming.
+    pub ci_parallel: bool,
     pub jobs: Vec<Job>,
 }
 
@@ -199,8 +219,17 @@ impl Config {
             push_tag_first: s.push_tag_first.unwrap_or(false),
             allow_empty_release: s.allow_empty_release.unwrap_or(true),
             tag_starts,
+            ci_parallel: s.ci_parallel.unwrap_or(false),
             jobs,
         })
+    }
+
+    /// Every default, and these jobs.
+    #[cfg(test)]
+    pub fn for_jobs(jobs: Vec<Job>) -> Config {
+        let mut c = Config::from_stated(Stated::default(), SHIP).unwrap();
+        c.jobs = jobs;
+        c
     }
 
     /// The name and URL, which a release cannot do without and CI can.
@@ -264,7 +293,7 @@ mod tests {
     fn everything_unstated_is_a_cargo_workspace_in_this_org() {
         let c = parse("name = alpha\nurl = https://github.com/diaryx-org/alpha\n").unwrap();
         assert!(c.version_quoted && c.publishes && c.allow_empty_release);
-        assert!(!c.push_tag_first && !c.verify_after_bump);
+        assert!(!c.push_tag_first && !c.verify_after_bump && !c.ci_parallel);
         assert_eq!(c.post_bump, None);
         assert_eq!(c.verify, None);
         assert_eq!(c.manifest, "Cargo.toml");
@@ -277,7 +306,20 @@ mod tests {
         let c = parse("job\n> *\n> > id = fmt\n> > name = Format\n> > run = cargo fmt --check\n")
             .unwrap();
         assert_eq!(c.jobs.len(), 1);
+        assert!(c.jobs[0].local && c.jobs[0].matrix && c.jobs[0].after.is_none());
         assert!(c.release_identity().is_err());
+    }
+
+    #[test]
+    fn where_and_when_a_job_runs() {
+        let c = parse(
+            "ci_parallel = true\njob\n> *\n> > id = gen\n> > name = Generate\n> > run = x\n> > matrix = false\n> *\n> > id = msrv\n> > name = MSRV\n> > run = y\n> > local = false\n> *\n> > id = test\n> > name = Test\n> > run = z\n> > after = gen\n",
+        )
+        .unwrap();
+        assert!(c.ci_parallel);
+        assert!(c.jobs[0].local && !c.jobs[0].matrix);
+        assert!(!c.jobs[1].local && c.jobs[1].matrix);
+        assert_eq!(c.jobs[2].after.as_deref(), Some("gen"));
     }
 
     #[test]

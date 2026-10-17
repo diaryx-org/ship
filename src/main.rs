@@ -8,6 +8,7 @@ mod changelog;
 mod ci;
 mod config;
 mod cut;
+mod parallel;
 mod propose;
 mod sh;
 mod version;
@@ -37,7 +38,7 @@ usage: ship [<spec>]          ship <command> --help for its flags and notes
     changelog            regenerate the unreleased region (--write, --check)
     notes [tag]          that release's changelog section, for the GitHub release body
     github [tag]         write that section to the GitHub release
-    ci [<job>]           run the config's CI jobs, or one of them (--list, --matrix)
+    ci [<job>]           run the config's CI jobs, or one of them (--parallel, --list, --matrix)
 
     help [--oneline]     this, or one line of it
 
@@ -85,15 +86,20 @@ nothing written. The version is named by whoever owns the release.
             "ship github [<tag>]\n\nWrite that section to the GitHub release, creating it or editing one something\nelse made. `ship <spec> --push` does this as its last step; this is for a tag\npushed by hand, or a push whose gh call did not land."
         }
         "ci" => {
-            "ship ci [<job>] [--list | --matrix]
+            "ship ci [<job>] [--parallel | --list | --matrix]
 
 Run the config's CI jobs in order, stopping at the first failure — or the one
 named. Each runs under `bash -eo pipefail -c` at the repository root, the shell
-GitHub gives a `run:` step, so a job means the same thing here and there.
+GitHub gives a `run:` step, so a job means the same thing here and there. A job
+that says `local = false` runs only when named.
 
+  --parallel    every job at once, each into <git dir>/ship/ci/<id>.log; a job
+                with `after` waits for that one. The first to fail stops the
+                rest. `ci_parallel = true` in the config makes it the default
   --list        the jobs, and run nothing
   --matrix      the jobs as one line of JSON for a workflow's matrix, each
-                job's `runner` table flattened beside its id, name and run"
+                job's `runner` table flattened beside its id, name and run;
+                a job that says `matrix = false` is left out"
         }
         _ => return None,
     })
@@ -235,7 +241,7 @@ fn run(args: Vec<String>) -> Result<()> {
             cut::github(&sh, &config, rest.first())
         }
         "ci" => {
-            rest.only(name, &["--list", "--matrix"], 1)?;
+            rest.only(name, &["--parallel", "--list", "--matrix"], 1)?;
             if rest.has("--list") {
                 ci::list(&config)
             } else if rest.has("--matrix") {
@@ -244,7 +250,7 @@ fn run(args: Vec<String>) -> Result<()> {
             } else if let Some(id) = rest.first() {
                 ci::run_one(&sh, &config, id)
             } else {
-                ci::run_all(&sh, &config)
+                ci::run_all(&sh, &config, rest.has("--parallel"))
             }
         }
         _ => unreachable!("every command is matched above"),

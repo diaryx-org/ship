@@ -179,7 +179,7 @@ fn verify(sh: &Sh, config: &Config, skip: bool) -> Result<()> {
         return Ok(());
     }
     match &config.verify {
-        None if !config.jobs.is_empty() => ci::run_all(sh, config),
+        None if !config.jobs.is_empty() => ci::run_all(sh, config, false),
         command => {
             sh.step("Verify");
             sh.shell(command.as_deref().unwrap_or("cargo xtask ci"))
