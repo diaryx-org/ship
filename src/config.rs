@@ -54,6 +54,8 @@ struct Stated {
     allow_empty_release: Option<bool>,
     tag_starts: Option<Vec<TagStart>>,
     ci_parallel: Option<bool>,
+    per_crate: Option<bool>,
+    crates: Option<Vec<String>>,
     job: Option<Vec<Job>>,
 }
 
@@ -146,6 +148,12 @@ pub struct Config {
     /// Whether `ship ci` runs its jobs at once, each into a log of its own,
     /// rather than in order with their output streaming.
     pub ci_parallel: bool,
+    /// Whether each crate of the workspace is released on its own: its own
+    /// version, tags, changelog and proposal. See `line.rs`.
+    pub per_crate: bool,
+    /// The crates released on their own, where `per_crate` should not find
+    /// them itself.
+    pub crates: Option<Vec<String>>,
     pub jobs: Vec<Job>,
 }
 
@@ -196,6 +204,22 @@ impl Config {
         }
         let jobs = s.job.unwrap_or_default();
         crate::ci::check(&jobs, source)?;
+        let per_crate = s.per_crate.unwrap_or(false);
+        if s.crates.is_some() && !per_crate {
+            bail!(
+                "{source} names `crates` without `per_crate = true`\nhint: `crates` says which crates release on their own, which only means something per crate"
+            );
+        }
+        // One version reaches a mirror by copying it, and per crate there is
+        // no one version to copy.
+        if per_crate
+            && (s.mirrors.as_ref().is_some_and(|m| !m.is_empty())
+                || s.cargo_workspace == Some(false))
+        {
+            bail!(
+                "{source} sets `per_crate`, which needs the canonical manifest to be a Cargo workspace and no `mirrors`"
+            );
+        }
         Ok(Config {
             source: source.to_string(),
             name: s.name,
@@ -220,6 +244,8 @@ impl Config {
             allow_empty_release: s.allow_empty_release.unwrap_or(true),
             tag_starts,
             ci_parallel: s.ci_parallel.unwrap_or(false),
+            per_crate,
+            crates: s.crates,
             jobs,
         })
     }
@@ -230,6 +256,13 @@ impl Config {
         let mut c = Config::from_stated(Stated::default(), SHIP).unwrap();
         c.jobs = jobs;
         c
+    }
+
+    /// A config read from figl, for another module's tests.
+    #[cfg(test)]
+    pub fn parse_for_test(figl: &str) -> Result<Config> {
+        let stated: Stated = fig_figl::from_str(figl).map_err(|e| e.to_string())?;
+        Config::from_stated(stated, SHIP)
     }
 
     /// The name and URL, which a release cannot do without and CI can.
@@ -299,6 +332,20 @@ mod tests {
         assert_eq!(c.manifest, "Cargo.toml");
         assert_eq!(c.version_prefix, "version = \"");
         assert!(c.extra_version_files.is_empty() && c.jobs.is_empty());
+        assert!(!c.per_crate && c.crates.is_none());
+    }
+
+    #[test]
+    fn per_crate_is_asked_for_and_checked() {
+        let c = parse("name = a\nurl = b\nper_crate = true\ncrates = [a-git, a-remark]\n").unwrap();
+        assert!(c.per_crate);
+        assert_eq!(
+            c.crates.as_deref(),
+            Some(&["a-git".to_string(), "a-remark".to_string()][..])
+        );
+        assert!(parse("name = a\nurl = b\ncrates = [a-git]\n").is_err());
+        assert!(parse("name = a\nurl = b\nper_crate = true\nmirrors = [x/Cargo.toml]\n").is_err());
+        assert!(parse("name = a\nurl = b\nper_crate = true\ncargo_workspace = false\n").is_err());
     }
 
     #[test]

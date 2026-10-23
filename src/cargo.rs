@@ -109,3 +109,24 @@ pub fn publishable(sh: &Sh, config: &Config) -> Result<Vec<String>> {
     }
     Ok(names)
 }
+
+/// One member of the canonical workspace, for a release per crate.
+pub struct Member {
+    pub name: String,
+    /// Relative to the root.
+    pub manifest: String,
+    pub publishable: bool,
+}
+
+/// Every member of the canonical workspace, in cargo's order.
+pub fn members(sh: &Sh) -> Result<Vec<Member>> {
+    let root = sh.root.canonicalize().unwrap_or_else(|_| sh.root.clone());
+    Ok(packages(sh, None)?
+        .into_iter()
+        .map(|p| Member {
+            manifest: relative(&root, &p.manifest_path),
+            publishable: p.publish.as_ref().is_none_or(|targets| !targets.is_empty()),
+            name: p.name,
+        })
+        .collect())
+}

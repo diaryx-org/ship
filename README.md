@@ -11,6 +11,7 @@ ship changelog          the unreleased region (--write splices it, --check verif
 ship notes [tag]        a release's changelog section, as the GitHub release body
 ship github [tag]       write that section to the GitHub release
 ship ci [<job>]         run the CI jobs, or one of them (--parallel, --list, --matrix)
+ship -p <crate> …       per crate: the crate a command acts on
 ```
 
 `<spec>` is `patch`, `minor`, `major`, an explicit `x.y.z[-pre]`, or `as-is`
@@ -65,10 +66,54 @@ url = https://github.com/diaryx-org/fig-lua
 | `allow_empty_release` | `true` | |
 | `tag_starts` | `[]` | what pushing the tag sets off, for the warning before the push |
 | `ci_parallel` | `false` | `ship ci` runs every job at once, as `--parallel` |
+| `per_crate` | `false` | each crate of the workspace releases on its own; see below |
+| `crates` | every crate that publishes | per crate, the crates that release |
 
 A repository from before ship keeps `.config/release.toml` and
 `.config/ci.toml`, and ship reads those where there is no `ship.figl`.
 `fig get .config/release.toml -o figl` converts one, comments and all.
+
+## Per crate
+
+A workspace whose crates move at different speeds says `per_crate = true`, and
+then each crate is a release line of its own:
+
+| | a crate with its own `[package] version` | the crates with `version.workspace = true` |
+|---|---|---|
+| version | its `[package] version` | `[workspace.package] version` |
+| tags | `<crate>-v1.2.0` | `v1.2.0` |
+| changelog | `CHANGELOG.md` in its directory | `changelog` |
+| commits | those touching its directory | those touching anything no other line owns |
+| `-p` | its name | the repository's `name`, or any of the crates |
+
+So a repository that takes its plugins in as members keeps the tags and the
+changelog it had, and each plugin gets its own. Where nothing inherits the
+workspace version, the crate named as the repository has the plain tags. A
+commit that touches two lines is in both changelogs; a changelog's headings
+say `## v1.2.0` whatever the tag is, since the file is the crate's own.
+
+git chooses a line's commits, and git-cliff only renders them: the changelog
+holds the commits `git log <range> -- <the line's paths>` shows, which is what
+the proposal counts. That matters for a crate brought in by `git subtree add`,
+whose old history touches paths at its old root (`src/`, `Cargo.toml`) that
+no directory excludes. git's walk never reaches that history, since the merge
+changes nothing outside the subtree, so none of it is the workspace line's.
+Nor are the `v*` tags it brought along.
+
+Every command takes `-p <crate>`. `ship` alone lists every crate with its
+version, its last tag and how many commits it has had since, and stops; `ship
+-p <crate>` is that crate's proposal and `ship -p <crate> <spec>` its release.
+`ship version` and `ship changelog` alone act on every crate, so `ship changelog
+--check` in CI checks them all. `notes` and `github` find the crate from the
+tag.
+
+Releasing one crate moves its version, the `{ path, version }` pins that name
+it in every manifest (`[workspace.dependencies]` included), and the lockfile;
+a pin to any other crate stays where it is. Preflight asks crates.io about
+that crate alone, at its own version. The commit says whose release it is:
+`chore: bump to <crate> 1.2.0`. `post_bump` runs with the crate's line in
+`SHIP_CRATE`. A crate that says `publish = false` is not released unless
+`crates` names it, and `mirrors` cannot be combined with `per_crate`.
 
 ## The changelog
 

@@ -29,6 +29,10 @@ job
 > > runner
 > > > components = clippy
 > *
+> > # The fixture tests in tests/fixtures.rs cut releases in throwaway
+> > # repositories, so they need git-cliff; without it they say so and pass.
 > > id = test
 > > name = Test
 > > run = cargo test
+> > runner
+> > > tools = git-cliff

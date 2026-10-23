@@ -10,6 +10,7 @@ use std::fmt;
 
 use crate::cargo;
 use crate::config::Config;
+use crate::line::Line;
 use crate::sh::Sh;
 use crate::{Result, bail};
 
@@ -172,36 +173,54 @@ pub fn next_patch(version: &Version) -> Version {
     Version::new(a, b, c + 1)
 }
 
-/// Every `v*` tag, oldest first, by git's own version ordering.
-pub fn release_tags(sh: &Sh) -> Result<Vec<String>> {
-    Ok(sh
-        .capture("git", &["tag", "--sort=v:refname", "--list", "v[0-9]*"])?
+/// Every tag of a line — `v*` for the whole repository, `<crate>-v*` for a
+/// crate — oldest first, by git's own version ordering. Per crate, less the
+/// tags on history the line's walk never reaches: a repository brought in by
+/// `git subtree add` brings its own `v*` tags, and they are not this line's.
+pub fn release_tags(sh: &Sh, line: &Line) -> Result<Vec<String>> {
+    let listed = sh.capture(
+        "git",
+        &[
+            "tag",
+            "--sort=v:refname",
+            "--list",
+            &line.tag_glob(),
+            "--format=%(refname:short) %(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)",
+        ],
+    )?;
+    let pruned = if line.whole {
+        Default::default()
+    } else {
+        line.pruned(sh)
+    };
+    Ok(listed
         .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
+        .filter_map(|l| {
+            let (tag, commit) = l.trim().split_once(' ')?;
+            (!pruned.contains(commit)).then(|| tag.to_string())
+        })
         .collect())
 }
 
-fn tagged_versions(sh: &Sh) -> Result<Vec<(String, Version)>> {
-    Ok(release_tags(sh)?
+fn tagged_versions(sh: &Sh, line: &Line) -> Result<Vec<(String, Version)>> {
+    Ok(release_tags(sh, line)?
         .into_iter()
-        .filter_map(|t| parse(&t[1..]).ok().map(|v| (t, v)))
+        .filter_map(|t| line.version_of(&t).map(|v| (t, v)))
         .collect())
 }
 
-/// The highest version any tag names, or `current` where nothing is tagged.
-/// This, and not the manifest, is what a bump has to clear.
-pub fn floor(sh: &Sh, current: &Version) -> Result<Version> {
-    Ok(highest(tagged_versions(sh)?)
+/// The highest version any of the line's tags names, or `current` where
+/// nothing is tagged. This, and not the manifest, is what a bump has to clear.
+pub fn floor(sh: &Sh, line: &Line, current: &Version) -> Result<Version> {
+    Ok(highest(tagged_versions(sh, line)?)
         .map(|(_, v)| v)
         .unwrap_or_else(|| current.clone()))
 }
 
 /// The tag naming the highest version — by SemVer, not by list order, so a
 /// repository whose tags sort oddly still names the same one as `floor`.
-pub fn latest_tag(sh: &Sh) -> Result<Option<String>> {
-    Ok(highest(tagged_versions(sh)?).map(|(t, _)| t))
+pub fn latest_tag(sh: &Sh, line: &Line) -> Result<Option<String>> {
+    Ok(highest(tagged_versions(sh, line)?).map(|(t, _)| t))
 }
 
 fn highest(tagged: Vec<(String, Version)>) -> Option<(String, Version)> {
@@ -214,23 +233,36 @@ fn highest(tagged: Vec<(String, Version)>) -> Option<(String, Version)> {
     })
 }
 
-/// The version every member inherits.
-pub fn read(sh: &Sh, config: &Config) -> Result<Version> {
-    version_in(&sh.read(&config.manifest)?, config, &config.manifest)
+/// The line's version: the one every member inherits, or one crate's own.
+pub fn read(sh: &Sh, config: &Config, line: &Line) -> Result<Version> {
+    version_in(&sh.read(&line.manifest)?, config, line, &line.manifest)
 }
 
 /// The version a tag's own tree names, or none where the tag has no manifest.
 /// The tree, not the working copy: a release cut months ago is read back from
 /// the commit it was cut at.
-pub fn read_at(sh: &Sh, config: &Config, tag: &str) -> Result<Option<Version>> {
-    let manifest = sh.try_capture("git", &["show", &format!("{tag}:{}", config.manifest)]);
+pub fn read_at(sh: &Sh, config: &Config, line: &Line, tag: &str) -> Result<Option<Version>> {
+    let manifest = sh.try_capture("git", &["show", &format!("{tag}:{}", line.manifest)]);
     if manifest.is_empty() {
         return Ok(None);
     }
-    version_in(&manifest, config, &format!("{} at {tag}", config.manifest)).map(Some)
+    version_in(
+        &manifest,
+        config,
+        line,
+        &format!("{} at {tag}", line.manifest),
+    )
+    .map(Some)
 }
 
-fn version_in(manifest: &str, config: &Config, place: &str) -> Result<Version> {
+fn version_in(manifest: &str, config: &Config, line: &Line, place: &str) -> Result<Version> {
+    if let Some(table) = line.table {
+        let Some(at) = crate::line::version_line(manifest, table) else {
+            bail!("no `version = \"…\"` under {table} in {place}");
+        };
+        let text = manifest.lines().nth(at).unwrap_or_default();
+        return parse(text.split('"').nth(1).unwrap_or_default());
+    }
     let Some(line) = manifest
         .lines()
         .find(|l| l.starts_with(&config.version_prefix))
@@ -398,8 +430,66 @@ fn dir_of(manifest: &str) -> Option<String> {
         .filter(|d| !d.is_empty())
 }
 
+/// Move a line to `next`: the whole repository, or one crate.
+pub fn write(sh: &Sh, config: &Config, line: &Line, next: &Version) -> Result<()> {
+    if line.whole {
+        write_whole(sh, config, next)
+    } else {
+        write_line(sh, config, line, next)
+    }
+}
+
+/// The version line under the line's table, and nothing else in the file.
+pub fn retarget_in_table(text: &str, table: &str, next: &Version) -> Option<String> {
+    let at = crate::line::version_line(text, table)?;
+    let lines: Vec<String> = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            if i == at {
+                retarget_version_line(l, "version = \"", next, false)
+            } else {
+                Some(l.to_string())
+            }
+        })
+        .collect::<Option<_>>()?;
+    Some(lines_out(&lines))
+}
+
+/// One crate, or the crates that inherit the workspace version: its version
+/// line, and the `{ path, version }` pins that name its crates — in every
+/// manifest, since a pin to one crate can sit in any other. A pin to a crate
+/// on another line stays where it is.
+fn write_line(sh: &Sh, config: &Config, line: &Line, next: &Version) -> Result<()> {
+    let Some(table) = line.table else {
+        bail!("{} has no table to find its version under", line.name);
+    };
+    let text = sh.read(&line.manifest)?;
+    let Some(moved) = retarget_in_table(&text, table, next) else {
+        bail!(
+            "no `version = \"…\"` under {table} in {}, or it is unterminated",
+            line.manifest
+        );
+    };
+    sh.write(&line.manifest, &moved)?;
+    println!("{} -> {next}", line.manifest);
+    // The root's own, too: a virtual root is no package, so cargo does not
+    // list it, and `[workspace.dependencies]` is where pins usually sit.
+    let mut manifests = vec![config.manifest.clone()];
+    for w in cargo::workspaces(sh, config)? {
+        manifests.extend(w.manifests.into_iter().filter(|m| m != &config.manifest));
+    }
+    for path in &manifests {
+        retarget_path_deps(sh, path, next, &line.crates)?;
+    }
+    if let Some(command) = &config.post_bump {
+        sh.shell_env(command, &[("SHIP_CRATE", &line.name)])?;
+    }
+    sh.call("cargo", &["update", "--workspace", "--quiet"])
+}
+
 /// Move the workspace to `next`, in every file that carries it.
-pub fn write(sh: &Sh, config: &Config, next: &Version) -> Result<()> {
+fn write_whole(sh: &Sh, config: &Config, next: &Version) -> Result<()> {
     let workspaces = cargo::workspaces(sh, config)?;
     let members_of = |manifest: &str| {
         workspaces
