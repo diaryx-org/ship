@@ -8,6 +8,7 @@ mod changelog;
 mod ci;
 mod config;
 mod cut;
+mod line;
 mod parallel;
 mod propose;
 mod sh;
@@ -27,7 +28,7 @@ const ONELINE: &str = "ship: cut a repository's release and run its CI from .con
 
 const USAGE: &str = "ship — cut a repository's release, and run its CI.
 
-usage: ship [<spec>]          ship <command> --help for its flags and notes
+usage: ship [-p <crate>] [<spec>]     ship <command> --help for its flags and notes
 
   inside one repository:
 
@@ -41,6 +42,12 @@ usage: ship [<spec>]          ship <command> --help for its flags and notes
     ci [<job>]           run the config's CI jobs, or one of them (--parallel, --list, --matrix)
 
     help [--oneline]     this, or one line of it
+
+  per crate, where the config says `per_crate = true`:
+
+    -p <crate>           which crate a command acts on; `ship` alone lists the
+                         crates with unreleased changes, and `version` and
+                         `changelog` alone act on every crate
 
   worth knowing:
 
@@ -57,7 +64,7 @@ there is no ship.figl.";
 fn help_for(command: &str) -> Option<&'static str> {
     Some(match command {
         "release" => {
-            "ship [<spec>] [--push] [--no-verify] [--propose]
+            "ship [-p <crate>] [<spec>] [--push] [--no-verify] [--propose]
 
 Bump, regenerate the changelog, commit, tag — and push only with --push.
 
@@ -66,24 +73,26 @@ would move to, what the commits since the last tag say about the promise, and
 nothing written. The version is named by whoever owns the release.
 
   <spec>        patch | minor | major | X.Y.Z[-pre] | as-is
+  -p <crate>    per crate, the crate to release; without one, the crates
+                with commits since their last release
   --propose     print the proposal even with a spec, and cut nothing
   --push        push the commit and tag, and write the GitHub release
   --no-verify   skip the repository's CI before the cut"
         }
         "version" => {
-            "ship version\n\nWhat the repository calls itself: the version in its manifest."
+            "ship version [-p <crate>]\n\nWhat the repository calls itself: the version in its manifest. Per crate, each\ncrate's, or the one named."
         }
         "bump" => {
-            "ship bump [<spec>] [--propose]\n\nMove the version in every manifest that carries it, and nothing else. With no\nspec, the proposal."
+            "ship bump [-p <crate>] [<spec>] [--propose]\n\nMove the version in every manifest that carries it, and nothing else. With no\nspec, the proposal."
         }
         "changelog" => {
-            "ship changelog [--write | --check]\n\nThe unreleased region, rendered by git-cliff: printed, spliced into the\nchangelog (--write), or checked current (--check). --write and --check also\ngive any tag still without a section one."
+            "ship changelog [-p <crate>] [--write | --check]\n\nThe unreleased region, rendered by git-cliff: printed, spliced into the\nchangelog (--write), or checked current (--check). --write and --check also\ngive any tag still without a section one. Per crate, every crate's changelog,\nor the one named."
         }
         "notes" => {
-            "ship notes [<tag>]\n\nThat release's changelog section, as the GitHub release body. Default: the\nversion in the manifest."
+            "ship notes [-p <crate>] [<tag>]\n\nThat release's changelog section, as the GitHub release body. Default: the\nversion in the manifest. Per crate, the tag says whose it is."
         }
         "github" => {
-            "ship github [<tag>]\n\nWrite that section to the GitHub release, creating it or editing one something\nelse made. `ship <spec> --push` does this as its last step; this is for a tag\npushed by hand, or a push whose gh call did not land."
+            "ship github [-p <crate>] [<tag>]\n\nWrite that section to the GitHub release, creating it or editing one something\nelse made. `ship <spec> --push` does this as its last step; this is for a tag\npushed by hand, or a push whose gh call did not land."
         }
         "ci" => {
             "ship ci [<job>] [--parallel | --list | --matrix]
@@ -140,6 +149,51 @@ impl Args {
     }
 }
 
+/// `-p <crate>`, `--package <crate>` or `--package=<crate>`, taken out of the
+/// arguments before they are split, so its value is not read as a spec.
+fn take_package(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
+    let mut selector = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let value = match arg.as_str() {
+            "-p" | "--package" => match it.next() {
+                Some(v) if !v.starts_with('-') => v.clone(),
+                _ => bail!("{arg} needs a crate\nhint: ship -p <crate>"),
+            },
+            a if a.starts_with("--package=") => a["--package=".len()..].to_string(),
+            _ => {
+                rest.push(arg.clone());
+                continue;
+            }
+        };
+        if selector.replace(value).is_some() {
+            bail!("one crate at a time: -p is given twice");
+        }
+    }
+    Ok((selector, rest))
+}
+
+/// The line a `notes` or `github` acts on: the one named, else the one the
+/// tag belongs to, else — at one version — the repository.
+fn line_for_tag(
+    sh: &Sh,
+    config: &Config,
+    selector: Option<&str>,
+    tag: Option<&str>,
+) -> Result<line::Line> {
+    if let (None, Some(tag), true) = (selector, tag, config.per_crate) {
+        let all = line::lines(sh, config)?;
+        return match line::for_tag(&all, tag) {
+            Some(found) => Ok(found),
+            None => bail!(
+                "{tag} is not a tag of any crate here\nhint: a crate's tags are <crate>-v<x.y.z>, and the workspace's v<x.y.z>"
+            ),
+        };
+    }
+    line::select(sh, config, selector)
+}
+
 fn run(args: Vec<String>) -> Result<()> {
     let command = args.first().map(String::as_str).unwrap_or("");
     let is_command = matches!(
@@ -164,10 +218,13 @@ fn run(args: Vec<String>) -> Result<()> {
     }
 
     let (name, rest) = if is_command {
-        (command, split(&args[1..]))
+        (command, &args[1..])
     } else {
-        ("release", split(&args))
+        ("release", &args[..])
     };
+    let (selector, rest) = take_package(rest)?;
+    let rest = split(&rest);
+    let selector = selector.as_deref();
     if rest.has("--help") || rest.has("-h") {
         println!("{}", help_for(name).unwrap_or(USAGE));
         return Ok(());
@@ -175,6 +232,17 @@ fn run(args: Vec<String>) -> Result<()> {
 
     let sh = Sh::new()?;
     let config = Config::load(&sh)?;
+    // Per crate, with no crate named, a proposal is the list of crates.
+    let propose = |sh: &Sh, config: &Config| {
+        if config.per_crate && selector.is_none() {
+            propose::summary(sh, config, &line::lines(sh, config)?)
+        } else {
+            propose::report(sh, config, &line::select(sh, config, selector)?)
+        }
+    };
+    if selector.is_some() && name == "ci" {
+        bail!("`ship ci` runs the repository's jobs, and takes no crate");
+    }
     match name {
         "release" => {
             rest.only(name, &["--propose", "--push", "--no-verify"], 1)?;
@@ -182,6 +250,7 @@ fn run(args: Vec<String>) -> Result<()> {
                 Some(spec) if !rest.has("--propose") => cut::release(
                     &sh,
                     &config,
+                    &line::select(&sh, &config, selector)?,
                     spec,
                     rest.has("--push"),
                     rest.has("--no-verify"),
@@ -195,30 +264,38 @@ fn run(args: Vec<String>) -> Result<()> {
                             "--push needs a version named: a proposal writes nothing\nhint: ship <spec> --push"
                         );
                     }
-                    propose::report(&sh, &config)
+                    propose(&sh, &config)
                 }
             }
         }
         "version" => {
             rest.only(name, &[], 0)?;
-            println!("{}", version::read(&sh, &config)?);
+            if config.per_crate && selector.is_none() {
+                for l in line::lines(&sh, &config)? {
+                    println!("{} {}", l.name, version::read(&sh, &config, &l)?);
+                }
+            } else {
+                let l = line::select(&sh, &config, selector)?;
+                println!("{}", version::read(&sh, &config, &l)?);
+            }
             Ok(())
         }
         "bump" => {
             rest.only(name, &["--propose"], 1)?;
             match rest.first() {
                 Some(spec) if !rest.has("--propose") => {
-                    let current = version::read(&sh, &config)?;
-                    let next =
-                        version::bump(&current, spec, Some(&version::floor(&sh, &current)?))?;
+                    let l = line::select(&sh, &config, selector)?;
+                    let current = version::read(&sh, &config, &l)?;
+                    let floor = version::floor(&sh, &l, &current)?;
+                    let next = version::bump(&current, spec, Some(&floor))?;
                     if version::compare(&next, &current) == std::cmp::Ordering::Equal {
                         println!("{current}, as is — nothing to bump");
                         return Ok(());
                     }
                     println!("{current} -> {next}");
-                    version::write(&sh, &config, &next)
+                    version::write(&sh, &config, &l, &next)
                 }
-                _ => propose::report(&sh, &config),
+                _ => propose(&sh, &config),
             }
         }
         "changelog" => {
@@ -229,16 +306,38 @@ fn run(args: Vec<String>) -> Result<()> {
                 (false, true) => changelog::Mode::Check,
                 (false, false) => changelog::Mode::Print,
             };
-            changelog::check_or_write(&sh, &config, mode)
+            if config.per_crate && selector.is_none() {
+                // Every crate, and every failure said, before the first fails
+                // the command: a check in CI should name all that are stale.
+                let mut failed = Vec::new();
+                for l in line::lines(&sh, &config)? {
+                    if let changelog::Mode::Print = mode {
+                        println!("{}", sh.bold(&format!("{} — {}", l.name, l.changelog)));
+                    }
+                    if let Err(e) = changelog::check_or_write(&sh, &config, &l, &mode) {
+                        eprintln!("error: {}: {e}", l.name);
+                        failed.push(l.name);
+                    }
+                }
+                if !failed.is_empty() {
+                    bail!("the changelog of {} did not pass", failed.join(", "));
+                }
+                Ok(())
+            } else {
+                let l = line::select(&sh, &config, selector)?;
+                changelog::check_or_write(&sh, &config, &l, &mode)
+            }
         }
         "notes" => {
             rest.only(name, &[], 1)?;
-            println!("{}", changelog::notes_text(&sh, &config, rest.first())?);
+            let l = line_for_tag(&sh, &config, selector, rest.first())?;
+            println!("{}", changelog::notes_text(&sh, &config, &l, rest.first())?);
             Ok(())
         }
         "github" => {
             rest.only(name, &[], 1)?;
-            cut::github(&sh, &config, rest.first())
+            let l = line_for_tag(&sh, &config, selector, rest.first())?;
+            cut::github(&sh, &config, &l, rest.first())
         }
         "ci" => {
             rest.only(name, &["--parallel", "--list", "--matrix"], 1)?;

@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::line::Line;
 use crate::sh::Sh;
 use crate::version::{self, Version};
 use crate::{Result, bail};
@@ -103,13 +104,27 @@ pub fn region(body: &str) -> String {
     [BEGIN, "", body, "", END].join("\n")
 }
 
+/// git-cliff's arguments: the config, the line's tags and paths, and these.
+fn cliff_args(cliff: &Cliff, line: &Line, pattern: Option<&str>, rest: &[&str]) -> Vec<String> {
+    let mut args = vec!["--config".to_string(), cliff.arg()];
+    args.extend(line.cliff_args(pattern));
+    args.extend(rest.iter().map(|a| a.to_string()));
+    args
+}
+
+fn run_cliff(sh: &Sh, args: &[String], envs: &[(&str, &str)]) -> String {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    sh.try_capture_env("git-cliff", &args, envs)
+}
+
 /// The unreleased commits, rendered by git-cliff. git-cliff exits non-zero
 /// when there is nothing unreleased, which right after a tag is normal.
-pub fn generated(sh: &Sh, cliff: &Cliff) -> Result<String> {
+pub fn generated(sh: &Sh, cliff: &Cliff, line: &Line) -> Result<String> {
     sh.require("git-cliff", CLIFF_HINT)?;
-    let body = sh.try_capture(
-        "git-cliff",
-        &["--config", &cliff.arg(), "--unreleased", "--strip", "all"],
+    let body = run_cliff(
+        sh,
+        &cliff_args(cliff, line, None, &["--unreleased", "--strip", "all"]),
+        &[],
     );
     let body = body.trim();
     Ok(if body.is_empty() {
@@ -119,32 +134,42 @@ pub fn generated(sh: &Sh, cliff: &Cliff) -> Result<String> {
     })
 }
 
-pub fn nothing_unreleased(sh: &Sh, cliff: &Cliff) -> Result<bool> {
-    Ok(generated(sh, cliff)? == EMPTY_REGION)
+pub fn nothing_unreleased(sh: &Sh, cliff: &Cliff, line: &Line) -> Result<bool> {
+    Ok(generated(sh, cliff, line)? == EMPTY_REGION)
 }
 
 /// The commits a tag covers. The first tag a changelog covers has no previous
 /// tag, and `<root>..<tag>` would drop the root commit; for that one, ask
 /// git-cliff for the tag's own section, with the tag pattern pinned to it.
-fn tagged(sh: &Sh, cliff: &Cliff, previous: Option<&str>, tag: &str) -> String {
+fn tagged(sh: &Sh, cliff: &Cliff, line: &Line, previous: Option<&str>, tag: &str) -> String {
     let body = match previous {
-        None => {
+        // The whole repository pins it through the environment, as it always
+        // has; a line passes its pattern as a flag, which the pin replaces.
+        None if line.whole => {
             let pinned = format!("^{}$", tag.replace('.', "\\."));
-            sh.try_capture_env(
-                "git-cliff",
-                &["--config", &cliff.arg(), "--strip", "all", "--latest"],
+            run_cliff(
+                sh,
+                &cliff_args(cliff, line, None, &["--strip", "all", "--latest"]),
                 &[("GIT_CLIFF__GIT__TAG_PATTERN", &pinned)],
             )
         }
-        Some(previous) => sh.try_capture(
-            "git-cliff",
-            &[
-                "--config",
-                &cliff.arg(),
-                "--strip",
-                "all",
-                &format!("{previous}..{tag}"),
-            ],
+        None => {
+            let pinned = format!("^{}$", crate::line::escape(tag));
+            run_cliff(
+                sh,
+                &cliff_args(cliff, line, Some(&pinned), &["--strip", "all", "--latest"]),
+                &[],
+            )
+        }
+        Some(previous) => run_cliff(
+            sh,
+            &cliff_args(
+                cliff,
+                line,
+                None,
+                &["--strip", "all", &format!("{previous}..{tag}")],
+            ),
+            &[],
         ),
     };
     let body = body.trim();
@@ -158,22 +183,37 @@ fn tagged(sh: &Sh, cliff: &Cliff, previous: Option<&str>, tag: &str) -> String {
 /// Tags with no section of their own, rendered and dated. A tag can arrive
 /// after the release it stood for went out, and without this its commits
 /// would leave the file: no longer unreleased, and in no section either.
-fn missing_sections(sh: &Sh, config: &Config, cliff: &Cliff, text: &str) -> Result<Vec<String>> {
+fn missing_sections(
+    sh: &Sh,
+    config: &Config,
+    line: &Line,
+    cliff: &Cliff,
+    text: &str,
+) -> Result<Vec<String>> {
     let existing: Vec<String> = text.lines().filter_map(section_tag).collect();
-    let all = version::release_tags(sh)?;
+    let all: Vec<String> = version::release_tags(sh, line)?
+        .into_iter()
+        .filter(|t| line.version_of(t).is_some())
+        .collect();
     // A changelog is allowed a starting point, and the backfill stops there
-    // rather than inventing history nobody wrote a changelog for.
+    // rather than inventing history nobody wrote a changelog for. It is a `v`
+    // tag, so it is the starting point of the line with the plain tags.
     let since = match &config.changelog_since {
-        None => None,
-        Some(tag) => Some(version::parse(tag.strip_prefix('v').unwrap_or(tag))?),
+        Some(tag) if line.prefix == "v" => {
+            Some(version::parse(tag.strip_prefix('v').unwrap_or(tag))?)
+        }
+        _ => None,
     };
     let mut sections = Vec::new();
     for (i, tag) in all.iter().enumerate() {
-        if existing.contains(tag) {
+        let (Some(short), Some(named)) = (line.short(tag), line.version_of(tag)) else {
+            continue;
+        };
+        if existing.contains(&short) {
             continue;
         }
         if let Some(since) = &since
-            && version::compare(&version::parse(&tag[1..])?, since) == Ordering::Less
+            && version::compare(&named, since) == Ordering::Less
         {
             continue;
         }
@@ -182,11 +222,11 @@ fn missing_sections(sh: &Sh, config: &Config, cliff: &Cliff, text: &str) -> Resu
         } else {
             Some(all[i - 1].as_str())
         };
-        let body = tagged(sh, cliff, previous, tag);
+        let body = tagged(sh, cliff, line, previous, tag);
         let date = sh.capture("git", &["log", "-1", "--format=%cs", tag])?;
         sections.push(format!(
             "{}\n\n{body}\n",
-            section_heading(config, tag, date.trim())
+            section_heading(config, &short, date.trim())
         ));
     }
     Ok(sections)
@@ -280,18 +320,26 @@ pub enum Mode {
 }
 
 /// `ship changelog [--write|--check]` — print, splice, or verify.
-pub fn check_or_write(sh: &Sh, config: &Config, mode: Mode) -> Result<()> {
+pub fn check_or_write(sh: &Sh, config: &Config, line: &Line, mode: &Mode) -> Result<()> {
     let cliff = Cliff::new(sh, config)?;
-    let path = &config.changelog;
-    let body = generated(sh, &cliff)?;
+    let path = &line.changelog;
+    let body = generated(sh, &cliff, line)?;
     if let Mode::Print = mode {
         println!("{}", region(&body));
         return Ok(());
     }
-    let current = sh.read(path)?;
+    let current = sh.read(path).map_err(|e| {
+        if line.whole {
+            e
+        } else {
+            format!(
+                "{e}\nhint: a crate's changelog starts as `# Changelog`, `## Unreleased`, and the two git-cliff markers on lines of their own:\n  {BEGIN}\n  {END}"
+            )
+        }
+    })?;
     // Two jobs, because a tag can arrive after the commits it names: refresh
     // the region, and give any tag still without a section one.
-    let missing = missing_sections(sh, config, &cliff, &current)?;
+    let missing = missing_sections(sh, config, line, &cliff, &current)?;
     let named: Vec<String> = missing
         .iter()
         .filter_map(|s| section_tag(s.lines().next()?))
@@ -320,10 +368,10 @@ pub fn check_or_write(sh: &Sh, config: &Config, mode: Mode) -> Result<()> {
 
 /// Turn the unreleased region into a released section, and reset the region.
 /// Between the bump and the commit, so the release commit carries both.
-pub fn cut(sh: &Sh, config: &Config, next: &Version) -> Result<()> {
+pub fn cut(sh: &Sh, config: &Config, line: &Line, next: &Version) -> Result<()> {
     let cliff = Cliff::new(sh, config)?;
-    let path = &config.changelog;
-    let body = generated(sh, &cliff)?;
+    let path = &line.changelog;
+    let body = generated(sh, &cliff, line)?;
     let date = sh.capture("date", &["+%Y-%m-%d"])?;
     let heading = section_heading(config, &next.tag(), date.trim());
     let released = format!("{heading}\n\n{body}\n");
@@ -339,13 +387,18 @@ pub fn cut(sh: &Sh, config: &Config, next: &Version) -> Result<()> {
 /// One release's section, without its heading — the body of a GitHub release.
 /// Read from the changelog the tag's own tree carries, so the notes on the
 /// release page are the ones the repository shipped.
-pub fn notes_text(sh: &Sh, config: &Config, tag: Option<&str>) -> Result<String> {
+pub fn notes_text(sh: &Sh, config: &Config, line: &Line, tag: Option<&str>) -> Result<String> {
     let (_, url) = config.release_identity()?;
     let tag = match tag {
         Some(t) => t.to_string(),
-        None => version::read(sh, config)?.tag(),
+        None => line.tag(&version::read(sh, config, line)?),
     };
-    let path = &config.changelog;
+    // What the line's own changelog heads the section with: the tag itself
+    // for the whole repository, `v<x.y.z>` in a crate's.
+    let Some(heading) = line.short(&tag) else {
+        bail!("{tag} is not a tag of {}", line.name);
+    };
+    let path = &line.changelog;
     // The tag's tree first, then the working one: a section can be written
     // after its tag — that is what the backfill is for — and a tag can predate
     // the changelog entirely.
@@ -355,7 +408,10 @@ pub fn notes_text(sh: &Sh, config: &Config, tag: Option<&str>) -> Result<String>
         candidates.push(at_tag);
     }
     candidates.push(sh.read(path)?);
-    let Some(body) = candidates.iter().find_map(|text| section_body(text, &tag)) else {
+    let Some(body) = candidates
+        .iter()
+        .find_map(|text| section_body(text, &heading))
+    else {
         bail!(
             "{path} has no section for {tag}\nhint: `ship changelog --write`, commit, and re-run — a tag whose changelog section is missing is a tag cut without one"
         );

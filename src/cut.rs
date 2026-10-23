@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 
 use crate::changelog::{self, Cliff};
 use crate::config::Config;
+use crate::line::Line;
 use crate::sh::Sh;
 use crate::version::{self, Version};
 use crate::{Result, bail, cargo, ci};
@@ -64,9 +65,11 @@ fn origin_state(sh: &Sh) -> &'static str {
 /// Refuse a release that is already doomed: nothing in it where that is not
 /// allowed, no gh to finish a push, a dirty tree, the wrong branch, a tag or a
 /// crates.io version already spent, a branch behind its origin.
+#[allow(clippy::too_many_arguments)]
 fn preflight(
     sh: &Sh,
     config: &Config,
+    line: &Line,
     cliff: &Cliff,
     name: &str,
     next: &Version,
@@ -74,7 +77,7 @@ fn preflight(
     push: bool,
 ) -> Result<()> {
     sh.require("git-cliff", CLIFF_HINT)?;
-    if !config.allow_empty_release && changelog::nothing_unreleased(sh, cliff)? {
+    if !config.allow_empty_release && changelog::nothing_unreleased(sh, cliff, line)? {
         bail!(
             "nothing to release: no commits since the last tag\nhint: {tag} would name the same tree as the tag before it"
         );
@@ -124,9 +127,12 @@ fn preflight(
         println!("warning: origin is {origin}; {tag} was checked against the local tags only");
     }
     // A crate can go up from a laptop, untagged, so ask the registry rather
-    // than the tag list.
+    // than the tag list — about this line's crates, at this line's version.
     let mut unasked = 0;
-    for crate_name in cargo::publishable(sh, config)? {
+    let publishable = cargo::publishable(sh, config)?
+        .into_iter()
+        .filter(|c| line.whole || line.crates.contains(c));
+    for crate_name in publishable {
         match already_published(sh, &crate_name, &next.to_string()) {
             None => unasked += 1,
             Some(true) => bail!(
@@ -197,17 +203,25 @@ fn restoring(sh: &Sh, step: impl FnOnce() -> Result<()>) -> Result<()> {
     })
 }
 
-pub fn release(sh: &Sh, config: &Config, spec: &str, push: bool, no_verify: bool) -> Result<()> {
-    let (name, url) = config.release_identity()?;
-    let current = version::read(sh, config)?;
+pub fn release(
+    sh: &Sh,
+    config: &Config,
+    line: &Line,
+    spec: &str,
+    push: bool,
+    no_verify: bool,
+) -> Result<()> {
+    let (repository, url) = config.release_identity()?;
+    let name = if line.whole { repository } else { &line.name };
+    let current = version::read(sh, config, line)?;
     // The floor is the highest tag, not the manifest: the two come apart when a
     // bump is committed and left unreleased, which `as-is` then tags.
-    let next = version::bump(&current, spec, Some(&version::floor(sh, &current)?))?;
-    let tag = next.tag();
+    let next = version::bump(&current, spec, Some(&version::floor(sh, line, &current)?))?;
+    let tag = line.tag(&next);
     let moving = version::compare(&next, &current) != Ordering::Equal;
 
     let cliff = Cliff::new(sh, config)?;
-    preflight(sh, config, &cliff, name, &next, &tag, push)?;
+    preflight(sh, config, line, &cliff, name, &next, &tag, push)?;
 
     // Verification comes before anything is written, except where it judges
     // the versions being written: twig's `zig build check` compares the zon
@@ -217,7 +231,7 @@ pub fn release(sh: &Sh, config: &Config, spec: &str, push: bool, no_verify: bool
     }
     if moving {
         sh.step(&format!("{current} -> {next}"));
-        restoring(sh, || version::write(sh, config, &next))?;
+        restoring(sh, || version::write(sh, config, line, &next))?;
     } else {
         sh.step(&format!("{next}, as is"));
         println!("the manifests already hold this version; nothing to bump");
@@ -225,21 +239,27 @@ pub fn release(sh: &Sh, config: &Config, spec: &str, push: bool, no_verify: bool
     if config.verify_after_bump {
         restoring(sh, || verify(sh, config, no_verify))?;
     }
-    restoring(sh, || changelog::cut(sh, config, &next))?;
+    restoring(sh, || changelog::cut(sh, config, line, &next))?;
 
     // Only the files a release moves, by name: whatever else is in the tree
     // stays out of the release commit.
     let mut staged = version::version_files(sh, config)?;
-    staged.push(config.changelog.clone());
+    staged.push(line.changelog.clone());
     let mut add = vec!["add"];
     add.extend(staged.iter().map(String::as_str));
     sh.call("git", &add)?;
     // `as-is` moves no version, and a commit claiming it did would read as a
     // bump nobody can find in the diff.
-    let subject = if moving {
-        format!("chore: bump to {next}")
+    // Per crate, the subject names it: the log is shared by every line.
+    let what = if line.whole {
+        next.to_string()
     } else {
-        format!("chore: release {next}")
+        format!("{} {next}", line.name)
+    };
+    let subject = if moving {
+        format!("chore: bump to {what}")
+    } else {
+        format!("chore: release {what}")
     };
     sh.call("git", &["commit", "-m", &subject])?;
     // Annotated: a release workflow reads `github.ref_name`, and `git
@@ -285,7 +305,7 @@ pub fn release(sh: &Sh, config: &Config, spec: &str, push: bool, no_verify: bool
     // The one step after the tag has left, so a failure here is something left
     // to finish rather than a release that went wrong.
     sh.step("GitHub release");
-    if let Err(e) = github(sh, config, Some(&tag)) {
+    if let Err(e) = github(sh, config, line, Some(&tag)) {
         println!(
             "\n{}\n\n{e}\n\nNothing is half-done — the tag and the commit are as they should be. To finish:\n\n    ship github {tag}\n",
             sh.red(&format!(
@@ -300,10 +320,10 @@ pub fn release(sh: &Sh, config: &Config, spec: &str, push: bool, no_verify: bool
 /// something else has already made it — a binary-attaching workflow can get
 /// there first. Everything is read from the tag's tree, so this is as right
 /// for a release cut months ago as for one cut a second ago.
-pub fn github(sh: &Sh, config: &Config, tag: Option<&str>) -> Result<()> {
+pub fn github(sh: &Sh, config: &Config, line: &Line, tag: Option<&str>) -> Result<()> {
     let tag = match tag {
         Some(t) => t.to_string(),
-        None => version::read(sh, config)?.tag(),
+        None => line.tag(&version::read(sh, config, line)?),
     };
     sh.require("gh", GH_HINT)?;
     if !sh.ok(
@@ -319,21 +339,24 @@ pub fn github(sh: &Sh, config: &Config, tag: Option<&str>) -> Result<()> {
     }
     // The tag must name the version it was cut from. Structural in a release
     // ship cut; not in one named by hand months later.
-    if let Some(named) = version::read_at(sh, config, &tag)?
-        && named.tag() != tag
+    if let Some(named) = version::read_at(sh, config, line, &tag)?
+        && line.tag(&named) != tag
     {
         bail!(
             "{tag} does not name version {named}, which is what {} says at that tag",
-            config.manifest
+            line.manifest
         );
     }
-    let notes = changelog::notes_text(sh, config, Some(&tag))?;
+    let notes = changelog::notes_text(sh, config, line, Some(&tag))?;
     // A pre-release tag cuts a pre-release — a version to try, not one GitHub
     // should show as Latest. Stated either way, so an edit corrects a release
     // something else created without knowing.
-    let prerelease = version::parse(tag.strip_prefix('v').unwrap_or(&tag))?
-        .pre
-        .is_some();
+    let prerelease = match line.version_of(&tag) {
+        Some(v) => v.pre.is_some(),
+        None => version::parse(tag.strip_prefix('v').unwrap_or(&tag))?
+            .pre
+            .is_some(),
+    };
     let pre = format!("--prerelease={prerelease}");
     if sh.ok("gh", &["release", "view", &tag, "--json", "tagName"]) {
         sh.call_with_stdin(

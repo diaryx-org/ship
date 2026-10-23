@@ -16,6 +16,7 @@ use std::cmp::Ordering;
 
 use crate::Result;
 use crate::config::Config;
+use crate::line::Line;
 use crate::sh::Sh;
 use crate::version::{self, Version};
 
@@ -179,14 +180,21 @@ pub struct Commit {
     pub behavioural: Vec<String>,
 }
 
-/// Every commit since the tag, or in the whole history where there is none.
-pub fn commits_since(sh: &Sh, tag: Option<&str>) -> Vec<Commit> {
+/// Every commit since the tag, or in the whole history where there is none —
+/// those that touch the line's paths, where it has any.
+pub fn commits_since(sh: &Sh, line: &Line, tag: Option<&str>) -> Vec<Commit> {
     let range = match tag {
         None => "HEAD".to_string(),
         Some(t) => format!("{t}..HEAD"),
     };
     let format = format!("--format=%h{US}%s{US}%b{RS}");
-    sh.try_capture("git", &["log", &format, &range])
+    let pathspec = line.pathspec();
+    let mut args = vec!["log", &format, &range];
+    if !pathspec.is_empty() {
+        args.push("--");
+        args.extend(pathspec.iter().map(String::as_str));
+    }
+    sh.try_capture("git", &args)
         .split(RS)
         .map(str::trim)
         .filter(|e| !e.is_empty())
@@ -255,12 +263,13 @@ fn columns() -> usize {
 /// The proposal, printed. Writes nothing, touches no remote, and needs no
 /// git-cliff: a proposal that had to install a tool to be read would be one
 /// people skip.
-pub fn report(sh: &Sh, config: &Config) -> Result<()> {
-    let (name, _) = config.release_identity()?;
-    let current = version::read(sh, config)?;
-    let floor = version::floor(sh, &current)?;
-    let tag = version::latest_tag(sh)?;
-    let commits = commits_since(sh, tag.as_deref());
+pub fn report(sh: &Sh, config: &Config, line: &Line) -> Result<()> {
+    let (repository, _) = config.release_identity()?;
+    let name = if line.whole { repository } else { &line.name };
+    let current = version::read(sh, config, line)?;
+    let floor = version::floor(sh, line, &current)?;
+    let tag = version::latest_tag(sh, line)?;
+    let commits = commits_since(sh, line, tag.as_deref());
 
     let head = match &tag {
         None => format!("{name} is at {current}, and has no release tag yet"),
@@ -343,9 +352,55 @@ pub fn report(sh: &Sh, config: &Config) -> Result<()> {
         }
     }
 
+    let p = if line.whole {
+        String::new()
+    } else {
+        format!(" -p {}", line.name)
+    };
     println!(
-        "\nNothing has been written. The version is yours to name:\n\n    ship patch | minor | major | <x.y.z[-pre]> | as-is\n\n`ship changelog` prints the unreleased region in full."
+        "\nNothing has been written. The version is yours to name:\n\n    ship{p} patch | minor | major | <x.y.z[-pre]> | as-is\n\n`ship changelog{p}` prints the unreleased region in full."
     );
+    Ok(())
+}
+
+/// Per crate with none named: every line, its version and last tag, and how
+/// many commits it has had since — which of them have something to release.
+pub fn summary(sh: &Sh, config: &Config, lines: &[Line]) -> Result<()> {
+    let (repository, _) = config.release_identity()?;
+    println!(
+        "\n{}\n",
+        sh.bold(&format!("{repository} releases each crate on its own"))
+    );
+    let width = lines.iter().map(|l| l.name.len()).max().unwrap_or(0);
+    let mut waiting = Vec::new();
+    for line in lines {
+        let current = version::read(sh, config, line)?;
+        let tag = version::latest_tag(sh, line)?;
+        let count = commits_since(sh, line, tag.as_deref()).len();
+        let since = match &tag {
+            None => "never released".to_string(),
+            Some(t) => format!("since {t}"),
+        };
+        let row = format!(
+            "  {:<width$}  {current:<10}  {count} commit(s) {since}",
+            line.name
+        );
+        if count == 0 {
+            println!("{}", sh.dim(&row));
+        } else {
+            println!("{row}");
+            waiting.push(line.name.as_str());
+        }
+    }
+    if waiting.is_empty() {
+        println!("\nNo crate has commits since its last release.");
+    } else {
+        println!(
+            "\nUnreleased changes in {}. Nothing has been written; name a crate for its proposal:\n\n    ship -p {}",
+            waiting.join(", "),
+            waiting[0]
+        );
+    }
     Ok(())
 }
 
