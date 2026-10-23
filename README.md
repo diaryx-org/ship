@@ -92,6 +92,14 @@ workspace version, the crate named as the repository has the plain tags. A
 commit that touches two lines is in both changelogs; a changelog's headings
 say `## v1.2.0` whatever the tag is, since the file is the crate's own.
 
+git chooses a line's commits, and git-cliff only renders them: the changelog
+holds the commits `git log <range> -- <the line's paths>` shows, which is what
+the proposal counts. That matters for a crate brought in by `git subtree add`,
+whose old history touches paths at its old root (`src/`, `Cargo.toml`) that
+no directory excludes. git's walk never reaches that history, since the merge
+changes nothing outside the subtree, so none of it is the workspace line's.
+Nor are the `v*` tags it brought along.
+
 Every command takes `-p <crate>`. `ship` alone lists every crate with its
 version, its last tag and how many commits it has had since, and stops; `ship
 -p <crate>` is that crate's proposal and `ship -p <crate> <spec>` its release.

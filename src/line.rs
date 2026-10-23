@@ -17,6 +17,8 @@
 //!
 //! A commit that touches two lines is in both changelogs.
 
+use std::collections::HashSet;
+
 use crate::config::Config;
 use crate::sh::Sh;
 use crate::version::{self, Version};
@@ -84,30 +86,9 @@ impl Line {
         format!("{}[0-9]*", self.prefix)
     }
 
-    /// git-cliff's arguments for this line: its tags, and its paths. None for
-    /// the whole repository, whose cliff config says it all. `pattern` pins
-    /// the tag pattern, for the first tag a changelog covers.
-    pub fn cliff_args(&self, pattern: Option<&str>) -> Vec<String> {
-        if self.whole {
-            return Vec::new();
-        }
-        let ours = format!("^{}[0-9]", escape(&self.prefix));
-        let mut args = vec![
-            "--tag-pattern".to_string(),
-            pattern.unwrap_or(&ours).to_string(),
-        ];
-        for dir in &self.include {
-            args.extend(["--include-path".into(), format!("{dir}/**")]);
-        }
-        for dir in &self.exclude {
-            args.extend(["--exclude-path".into(), format!("{dir}/**")]);
-        }
-        args
-    }
-
     /// The pathspec `git log` takes for this line's commits, after `--`; empty
-    /// for every commit. Means what git-cliff's paths mean: a commit is this
-    /// line's when it touches any file that is.
+    /// for every commit. A commit is this line's when it touches any file
+    /// that is, so one that touches two lines is in both.
     pub fn pathspec(&self) -> Vec<String> {
         if self.include.is_empty() && self.exclude.is_empty() {
             return Vec::new();
@@ -121,22 +102,55 @@ impl Line {
         spec
     }
 
+    /// The commits in `range` that are this line's: those `git log <range>
+    /// -- <pathspec>` shows, which is what the proposal counts and what the
+    /// changelog renders.
+    pub fn commits(&self, sh: &Sh, range: &str) -> HashSet<String> {
+        let spec = self.pathspec();
+        let mut args = vec!["log", "--format=%H", range];
+        if !spec.is_empty() {
+            args.push("--");
+            args.extend(spec.iter().map(String::as_str));
+        }
+        sh.try_capture("git", &args)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The commits this line's history leaves out entirely: those reachable
+    /// from HEAD only through a side of a merge that git's walk over the
+    /// line's paths prunes.
+    ///
+    /// A repository brought in by `git subtree add` is the case that needs
+    /// it. Its whole history comes along, every commit of it touching paths
+    /// at its old root — `src/lib.rs`, `Cargo.toml` — which no directory
+    /// excludes, and its own `v*` tags come with it. The merge changes nothing
+    /// outside the subtree, so git's walk follows the other parent and never
+    /// reaches that history; a tag on it is not this line's.
+    pub fn pruned(&self, sh: &Sh) -> HashSet<String> {
+        let spec = self.pathspec();
+        if spec.is_empty() {
+            return HashSet::new();
+        }
+        let mut args = vec!["rev-list", "--sparse", "HEAD", "--"];
+        args.extend(spec.iter().map(String::as_str));
+        let walked: HashSet<String> = sh
+            .try_capture("git", &args)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        sh.try_capture("git", &["rev-list", "HEAD"])
+            .lines()
+            .filter(|c| !walked.contains(*c))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Whether `-p <selector>` names this line: its own name, or any crate in it.
     pub fn answers_to(&self, selector: &str) -> bool {
         self.name == selector || self.crates.iter().any(|c| c == selector)
     }
-}
-
-/// A regex matching `text` and nothing else.
-pub fn escape(text: &str) -> String {
-    let mut out = String::new();
-    for c in text.chars() {
-        if !c.is_ascii_alphanumeric() && c != '_' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// How a member's manifest states its version.
@@ -462,15 +476,6 @@ mod tests {
         assert_eq!(git.short("historica-git-v0.3.0").as_deref(), Some("v0.3.0"));
         assert_eq!(git.short("v0.3.0"), None);
         assert_eq!(
-            git.cliff_args(None),
-            [
-                "--tag-pattern",
-                "^historica\\-git\\-v[0-9]",
-                "--include-path",
-                "historica-git/**"
-            ]
-        );
-        assert_eq!(
             ws.pathspec(),
             [".", ":(exclude)historica-git", ":(exclude)plugins/remark"]
         );
@@ -507,7 +512,7 @@ mod tests {
         let whole = [Line::whole(&single)];
         assert!(pick(&single, &whole, None).unwrap().whole);
         assert!(pick(&single, &whole, Some("alpha")).is_err());
-        assert!(whole[0].cliff_args(None).is_empty() && whole[0].pathspec().is_empty());
+        assert!(whole[0].pathspec().is_empty());
     }
 
     /// With nothing inheriting, the crate named as the repository keeps the

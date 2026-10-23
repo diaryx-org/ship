@@ -372,9 +372,13 @@ pub fn summary(sh: &Sh, config: &Config, lines: &[Line]) -> Result<()> {
         sh.bold(&format!("{repository} releases each crate on its own"))
     );
     let width = lines.iter().map(|l| l.name.len()).max().unwrap_or(0);
+    let versions = lines
+        .iter()
+        .map(|l| version::read(sh, config, l).map(|v| v.to_string()))
+        .collect::<Result<Vec<_>>>()?;
+    let wide = versions.iter().map(String::len).max().unwrap_or(0);
     let mut waiting = Vec::new();
-    for line in lines {
-        let current = version::read(sh, config, line)?;
+    for (line, current) in lines.iter().zip(&versions) {
         let tag = version::latest_tag(sh, line)?;
         let count = commits_since(sh, line, tag.as_deref()).len();
         let since = match &tag {
@@ -382,7 +386,7 @@ pub fn summary(sh: &Sh, config: &Config, lines: &[Line]) -> Result<()> {
             Some(t) => format!("since {t}"),
         };
         let row = format!(
-            "  {:<width$}  {current:<10}  {count} commit(s) {since}",
+            "  {:<width$}  {current:<wide$}  {count} commit(s) {since}",
             line.name
         );
         if count == 0 {

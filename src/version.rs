@@ -174,17 +174,31 @@ pub fn next_patch(version: &Version) -> Version {
 }
 
 /// Every tag of a line — `v*` for the whole repository, `<crate>-v*` for a
-/// crate — oldest first, by git's own version ordering.
+/// crate — oldest first, by git's own version ordering. Per crate, less the
+/// tags on history the line's walk never reaches: a repository brought in by
+/// `git subtree add` brings its own `v*` tags, and they are not this line's.
 pub fn release_tags(sh: &Sh, line: &Line) -> Result<Vec<String>> {
-    Ok(sh
-        .capture(
-            "git",
-            &["tag", "--sort=v:refname", "--list", &line.tag_glob()],
-        )?
+    let listed = sh.capture(
+        "git",
+        &[
+            "tag",
+            "--sort=v:refname",
+            "--list",
+            &line.tag_glob(),
+            "--format=%(refname:short) %(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)",
+        ],
+    )?;
+    let pruned = if line.whole {
+        Default::default()
+    } else {
+        line.pruned(sh)
+    };
+    Ok(listed
         .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
+        .filter_map(|l| {
+            let (tag, commit) = l.trim().split_once(' ')?;
+            (!pruned.contains(commit)).then(|| tag.to_string())
+        })
         .collect())
 }
 

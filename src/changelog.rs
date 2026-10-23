@@ -104,34 +104,111 @@ pub fn region(body: &str) -> String {
     [BEGIN, "", body, "", END].join("\n")
 }
 
-/// git-cliff's arguments: the config, the line's tags and paths, and these.
-fn cliff_args(cliff: &Cliff, line: &Line, pattern: Option<&str>, rest: &[&str]) -> Vec<String> {
-    let mut args = vec!["--config".to_string(), cliff.arg()];
-    args.extend(line.cliff_args(pattern));
-    args.extend(rest.iter().map(|a| a.to_string()));
-    args
+fn trimmed_or(body: &str, empty: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        empty.to_string()
+    } else {
+        body.to_string()
+    }
 }
 
-fn run_cliff(sh: &Sh, args: &[String], envs: &[(&str, &str)]) -> String {
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    sh.try_capture_env("git-cliff", &args, envs)
+/// A line's commits in `range`, rendered.
+///
+/// git-cliff parses and groups the range, and hands it back as its context;
+/// only the commits git's own walk over the line's paths gives are kept, and
+/// git-cliff renders what is left. git-cliff is not asked to choose them:
+/// its path filter reads each commit's diff alone, so the history a `git
+/// subtree add` brings in — whose commits touch paths at the old root — gets
+/// past an exclusion of the directory it now lives in, and its tag
+/// boundaries count tags that history brought along. Chosen by git, the
+/// changelog names the commits the proposal counts.
+fn rendered(sh: &Sh, cliff: &Cliff, line: &Line, range: &str) -> Result<String> {
+    // git-cliff takes `a..b`, and nothing for everything; a bare tag — a
+    // line's first — is everything, narrowed by git below.
+    let config = cliff.arg();
+    let mut args = vec!["--config", &config, "--context"];
+    if range.contains("..") {
+        args.push(range);
+    }
+    let context = sh.try_capture("git-cliff", &args);
+    if context.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let releases: fig::Value = fig_json::from_str(&context)
+        .map_err(|e| format!("could not read git-cliff's context: {e}"))?;
+    let fig::Value::Seq(releases) = releases else {
+        bail!("git-cliff's context is not a list of releases");
+    };
+    let ours = line.commits(sh, range);
+    // Oldest release first, so the commits stay in the order git-cliff
+    // sorted them; one release holds them all, since the range is one.
+    let mut kept = Vec::new();
+    for release in releases.iter().rev() {
+        if let Some(fig::Value::Seq(commits)) = field(release, "commits") {
+            kept.extend(commits.iter().filter(|c| {
+                matches!(field(c, "id"), Some(fig::Value::Str(id)) if ours.contains(id))
+            }).cloned());
+        }
+    }
+    let Some(fig::Value::Map(mut first)) = releases.into_iter().next() else {
+        return Ok(String::new());
+    };
+    if kept.is_empty() {
+        return Ok(String::new());
+    }
+    for (key, value) in first.iter_mut() {
+        if matches!(key, fig::Value::Str(k) if k == "commits") {
+            *value = fig::Value::Seq(std::mem::take(&mut kept));
+        }
+    }
+    let json = fig_json::format()
+        .and_then(|json| fig::Value::Seq(vec![fig::Value::Map(first)]).serialize(json))
+        .map_err(|e| format!("could not write git-cliff's context: {e}"))?;
+    let path = std::env::temp_dir().join(format!("ship-cliff-context-{}.json", std::process::id()));
+    std::fs::write(&path, json).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    let body = sh.try_capture(
+        "git-cliff",
+        &[
+            "--config",
+            &cliff.arg(),
+            "--strip",
+            "all",
+            "--from-context",
+            &path.to_string_lossy(),
+        ],
+    );
+    let _ = std::fs::remove_file(&path);
+    Ok(body)
+}
+
+fn field<'a>(value: &'a fig::Value, name: &str) -> Option<&'a fig::Value> {
+    match value {
+        fig::Value::Map(entries) => entries
+            .iter()
+            .find(|(k, _)| matches!(k, fig::Value::Str(k) if k == name))
+            .map(|(_, v)| v),
+        _ => None,
+    }
 }
 
 /// The unreleased commits, rendered by git-cliff. git-cliff exits non-zero
 /// when there is nothing unreleased, which right after a tag is normal.
 pub fn generated(sh: &Sh, cliff: &Cliff, line: &Line) -> Result<String> {
     sh.require("git-cliff", CLIFF_HINT)?;
-    let body = run_cliff(
-        sh,
-        &cliff_args(cliff, line, None, &["--unreleased", "--strip", "all"]),
-        &[],
-    );
-    let body = body.trim();
-    Ok(if body.is_empty() {
-        EMPTY_REGION.to_string()
+    let body = if line.whole {
+        sh.try_capture(
+            "git-cliff",
+            &["--config", &cliff.arg(), "--unreleased", "--strip", "all"],
+        )
     } else {
-        body.to_string()
-    })
+        let range = match version::latest_tag(sh, line)? {
+            Some(tag) => format!("{tag}..HEAD"),
+            None => "HEAD".to_string(),
+        };
+        rendered(sh, cliff, line, &range)?
+    };
+    Ok(trimmed_or(&body, EMPTY_REGION))
 }
 
 pub fn nothing_unreleased(sh: &Sh, cliff: &Cliff, line: &Line) -> Result<bool> {
@@ -140,44 +217,43 @@ pub fn nothing_unreleased(sh: &Sh, cliff: &Cliff, line: &Line) -> Result<bool> {
 
 /// The commits a tag covers. The first tag a changelog covers has no previous
 /// tag, and `<root>..<tag>` would drop the root commit; for that one, ask
-/// git-cliff for the tag's own section, with the tag pattern pinned to it.
-fn tagged(sh: &Sh, cliff: &Cliff, line: &Line, previous: Option<&str>, tag: &str) -> String {
+/// git-cliff for the tag's own section, with the tag pattern pinned to it —
+/// or, for a line, everything up to the tag.
+fn tagged(
+    sh: &Sh,
+    cliff: &Cliff,
+    line: &Line,
+    previous: Option<&str>,
+    tag: &str,
+) -> Result<String> {
     let body = match previous {
-        // The whole repository pins it through the environment, as it always
-        // has; a line passes its pattern as a flag, which the pin replaces.
-        None if line.whole => {
+        _ if !line.whole => {
+            let range = match previous {
+                Some(previous) => format!("{previous}..{tag}"),
+                None => tag.to_string(),
+            };
+            rendered(sh, cliff, line, &range)?
+        }
+        None => {
             let pinned = format!("^{}$", tag.replace('.', "\\."));
-            run_cliff(
-                sh,
-                &cliff_args(cliff, line, None, &["--strip", "all", "--latest"]),
+            sh.try_capture_env(
+                "git-cliff",
+                &["--config", &cliff.arg(), "--strip", "all", "--latest"],
                 &[("GIT_CLIFF__GIT__TAG_PATTERN", &pinned)],
             )
         }
-        None => {
-            let pinned = format!("^{}$", crate::line::escape(tag));
-            run_cliff(
-                sh,
-                &cliff_args(cliff, line, Some(&pinned), &["--strip", "all", "--latest"]),
-                &[],
-            )
-        }
-        Some(previous) => run_cliff(
-            sh,
-            &cliff_args(
-                cliff,
-                line,
-                None,
-                &["--strip", "all", &format!("{previous}..{tag}")],
-            ),
-            &[],
+        Some(previous) => sh.try_capture(
+            "git-cliff",
+            &[
+                "--config",
+                &cliff.arg(),
+                "--strip",
+                "all",
+                &format!("{previous}..{tag}"),
+            ],
         ),
     };
-    let body = body.trim();
-    if body.is_empty() {
-        NOTHING_RECORDED.to_string()
-    } else {
-        body.to_string()
-    }
+    Ok(trimmed_or(&body, NOTHING_RECORDED))
 }
 
 /// Tags with no section of their own, rendered and dated. A tag can arrive
@@ -222,7 +298,7 @@ fn missing_sections(
         } else {
             Some(all[i - 1].as_str())
         };
-        let body = tagged(sh, cliff, line, previous, tag);
+        let body = tagged(sh, cliff, line, previous, tag)?;
         let date = sh.capture("git", &["log", "-1", "--format=%cs", tag])?;
         sections.push(format!(
             "{}\n\n{body}\n",

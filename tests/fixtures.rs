@@ -452,3 +452,141 @@ fn a_single_version_repository_is_as_it_was() {
     assert!(notes.contains("/blob/v0.4.1/docs/CHANGELOG.md"), "{notes}");
     f.ok(&["changelog", "--check"]);
 }
+
+/// Bring `from`'s main into `into` under `prefix`, with its whole history and
+/// its tags, as `git subtree add` does. By hand where git has no subtree: the
+/// same merge, of an unrelated history whose tree lands under the prefix.
+fn subtree_add(into: &Fixture, from: &Fixture, prefix: &str) {
+    let source = from.root.to_string_lossy().into_owned();
+    into.git(&["fetch", "--quiet", &source, "refs/tags/*:refs/tags/*"]);
+    let out = into
+        .command("git")
+        .args(["subtree", "add", "--prefix", prefix, &source, "main"])
+        .output()
+        .unwrap();
+    if out.status.success() {
+        return;
+    }
+    into.git(&["fetch", "--quiet", &source, "main"]);
+    into.git(&[
+        "merge",
+        "--quiet",
+        "-s",
+        "ours",
+        "--no-commit",
+        "--allow-unrelated-histories",
+        "FETCH_HEAD",
+    ]);
+    into.git(&[
+        "read-tree",
+        &format!("--prefix={prefix}/"),
+        "-u",
+        "FETCH_HEAD",
+    ]);
+    into.git(&[
+        "commit",
+        "--quiet",
+        "-m",
+        &format!("Add '{prefix}/' from {source}"),
+    ]);
+}
+
+/// A plugin taken in by `git subtree add` brings its whole history, whose
+/// commits touch paths at its old root, and its own `v*` tags. None of it is
+/// the workspace line's: not in its proposal, its changelog, or its tags.
+#[test]
+fn a_subtree_brings_nothing_to_the_workspace_line() {
+    if !have_git_cliff() {
+        return;
+    }
+    let plugin = Fixture::new("subtree-plugin");
+    plugin.write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture-plugin\"\nversion = \"0.3.0\"\nedition = \"2021\"\n",
+    );
+    plugin.write("src/lib.rs", "pub fn plugin() {}\n");
+    plugin.commit("feat!: the plugin breaks something");
+    plugin.write("src/lib.rs", "pub fn plugin() {}\npub fn fixed() {}\n");
+    plugin.commit("fix: a plugin fix");
+    plugin.git(&["tag", "-a", "v0.3.0", "-m", "v0.3.0"]);
+    plugin.write(
+        "src/lib.rs",
+        "pub fn plugin() {}\npub fn fixed() {}\npub fn later() {}\n",
+    );
+    plugin.commit("feat: a plugin feature after its tag");
+
+    let f = Fixture::new("subtree-workspace");
+    f.write(".gitignore", "target/\n");
+    f.write(
+        ".config/ship.figl",
+        "name = fixture\nurl = https://github.com/diaryx-org/fixture\nper_crate = true\npublishes = false\nverify = exit 0\n",
+    );
+    f.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = []\nresolver = \"2\"\n\n[workspace.package]\nversion = \"1.0.0\"\n\n[package]\nname = \"fixture\"\nversion.workspace = true\nedition = \"2021\"\n",
+    );
+    f.write("src/lib.rs", "pub fn core() {}\n");
+    f.write("docs/CHANGELOG.md", CHANGELOG);
+    f.lockfile();
+    f.commit("feat: the core");
+    f.git(&["tag", "-a", "v1.0.0", "-m", "v1.0.0"]);
+    f.ok(&["changelog", "--write"]);
+    f.commit("docs: the changelog");
+    f.write("src/lib.rs", "pub fn core() {}\npub fn mended() {}\n");
+    f.commit("fix: a core fix");
+
+    subtree_add(&f, &plugin, "plugin");
+    assert!(
+        f.tags().contains(&"v0.3.0".to_string()),
+        "the plugin's tag came along"
+    );
+    f.write(
+        "Cargo.toml",
+        &f.read("Cargo.toml")
+            .replace("members = []", "members = [\"plugin\"]"),
+    );
+    f.write("plugin/CHANGELOG.md", CHANGELOG);
+    f.lockfile();
+    f.commit("chore: the plugin joins the workspace");
+
+    // The proposal: the core fix and the commit that joined the plugin,
+    // which moved the root manifest — and nothing the plugin brought.
+    let proposal = f.ok(&["-p", "fixture"]);
+    assert!(
+        proposal.contains("fixture is at 1.0.0; v1.0.0 is the highest tag"),
+        "{proposal}"
+    );
+    assert!(
+        proposal.contains("3 commits since v1.0.0 — 0 feat, 1 fix"),
+        "{proposal}"
+    );
+    assert!(!proposal.contains("break the promise"), "{proposal}");
+    assert!(!proposal.contains("the plugin breaks"), "{proposal}");
+
+    // The changelog: the same commits.
+    let region = f.ok(&["changelog", "-p", "fixture"]);
+    assert!(region.contains("a core fix"), "{region}");
+    for imported in ["the plugin breaks", "a plugin fix", "after its tag"] {
+        assert!(!region.contains(imported), "{imported} in\n{region}");
+    }
+
+    // The plugin's `v0.3.0` is not a release of the workspace line.
+    f.ok(&["changelog", "--write", "-p", "fixture"]);
+    assert!(!f.read("docs/CHANGELOG.md").contains("## v0.3.0"));
+    f.commit("docs: the changelog");
+
+    f.ok(&["-p", "fixture", "minor", "--no-verify"]);
+    assert!(f.tags().contains(&"v1.1.0".to_string()));
+    let log = f.read("docs/CHANGELOG.md");
+    let released = &log[log.find("## v1.1.0").unwrap()..log.find("## v1.0.0").unwrap()];
+    assert!(released.contains("a core fix"), "{released}");
+    for imported in [
+        "the plugin breaks",
+        "a plugin fix",
+        "after its tag",
+        "Breaking",
+    ] {
+        assert!(!released.contains(imported), "{imported} in\n{released}");
+    }
+    assert_eq!(package_version(&f.read("plugin/Cargo.toml")), "0.3.0");
+}
