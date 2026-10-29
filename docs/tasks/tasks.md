@@ -2,9 +2,10 @@
 title: Tasks
 description: Deferred work in ship — one file each, every one with a done state
 created: 2026-10-28
-updated: 2026-10-28
+updated: 2026-10-29
 contents:
   - "[A quoted dependency key keeps its old pin](quoted-dependency-key-keeps-its-pin.md)"
+  - "[A pre-release backfills against the wrong tag](a-pre-release-backfills-against-the-wrong-tag.md)"
 ---
 
 # Tasks
