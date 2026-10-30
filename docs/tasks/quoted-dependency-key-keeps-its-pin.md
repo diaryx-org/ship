@@ -1,13 +1,18 @@
 ---
 title: A quoted dependency key keeps its old pin
 description: A bump moves an internal `{ path, version }` pin only when the line's key, as written, is a member's name, so a TOML-quoted key such as `"demo-core" = { … }` is never moved — silently on a minor bump, and on a major one `cargo update` fails after the manifest has been rewritten
-status: open
+status: done
 created: 2026-10-28
-updated: 2026-10-28
+updated: 2026-10-30
 part_of: "[Tasks](tasks.md)"
 ---
 
 # A quoted dependency key keeps its old pin
+
+**Status.** Done, in `fix(version): a quoted dependency key is the member it
+names`. `retarget_path_dep` compares a key by the name it spells, with one
+pair of `"…"` or `'…'` quotes taken off, and
+`a_quoted_key_is_the_name_it_spells` pins both quote styles.
 
 `retarget_path_dep` in `src/version.rs` decides whether a `{ path, version }`
 line is an internal pin by its key: the text before the line's first `=`,

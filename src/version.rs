@@ -290,7 +290,7 @@ pub fn retarget_path_dep(line: &str, next: &Version, members: Option<&[String]>)
     }
     let at = line.find("version = \"")?;
     if let Some(members) = members {
-        let key = line.split('=').next().unwrap_or_default().trim();
+        let key = key_name(line.split('=').next().unwrap_or_default().trim());
         if !members.iter().any(|m| m == key) {
             return None;
         }
@@ -299,6 +299,19 @@ pub fn retarget_path_dep(line: &str, next: &Version, members: Option<&[String]>)
     let rest = &line[start..];
     let end = rest.find('"')?;
     Some(format!("{}{next}{}", &line[..start], &rest[end..]))
+}
+
+/// The name a TOML key spells: `"demo-core"` and `'demo-core'` are
+/// `demo-core`, as cargo reads them. A crate name holds no character a basic
+/// string has to escape, so a key with a backslash in it is left as written
+/// and matches no member.
+fn key_name(key: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = key.strip_prefix(quote).and_then(|k| k.strip_suffix(quote)) {
+            return inner;
+        }
+    }
+    key
 }
 
 /// The version after the prefix replaced, and everything after its closing
@@ -710,6 +723,39 @@ mod tests {
         );
         assert_eq!(
             retarget_path_dep(r#"version = "0.1.0""#, &v(0, 2, 0), None),
+            None
+        );
+    }
+
+    /// TOML lets a key be quoted, and cargo reads `"demo-core"` and
+    /// `'demo-core'` as `demo-core`, so the member is the name the key spells.
+    #[test]
+    fn a_quoted_key_is_the_name_it_spells() {
+        let members = ["demo-core".to_string()];
+        assert_eq!(
+            retarget_path_dep(
+                r#""demo-core" = { path = "crates/core", version = "1.0.0" }"#,
+                &v(2, 0, 0),
+                Some(&members)
+            )
+            .unwrap(),
+            r#""demo-core" = { path = "crates/core", version = "2.0.0" }"#
+        );
+        assert_eq!(
+            retarget_path_dep(
+                r#"'demo-core' = { path = "crates/core", version = "1.0.0" }"#,
+                &v(2, 0, 0),
+                Some(&members)
+            )
+            .unwrap(),
+            r#"'demo-core' = { path = "crates/core", version = "2.0.0" }"#
+        );
+        assert_eq!(
+            retarget_path_dep(
+                r#""demo-app" = { path = "crates/app", version = "1.0.0" }"#,
+                &v(2, 0, 0),
+                Some(&members)
+            ),
             None
         );
     }
