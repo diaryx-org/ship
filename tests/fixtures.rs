@@ -590,3 +590,114 @@ fn a_subtree_brings_nothing_to_the_workspace_line() {
     }
     assert_eq!(package_version(&f.read("plugin/Cargo.toml")), "0.3.0");
 }
+
+/// The text of one changelog section: its heading's line through the line
+/// before the next section's.
+fn section<'a>(log: &'a str, tag: &str) -> &'a str {
+    let heading = format!("## {tag} — ");
+    let start = log
+        .find(&heading)
+        .unwrap_or_else(|| panic!("no {heading} in\n{log}"));
+    let rest = &log[start + heading.len()..];
+    let end = rest
+        .find("\n## ")
+        .map_or(log.len(), |at| start + heading.len() + at);
+    &log[start..end]
+}
+
+/// Four tags cut by hand, a pre-release among them, and the changelog's
+/// backfill giving each tag the commits since the one before it by SemVer.
+/// git's `v:refname` sorts `1.0.0-rc.1` after `1.0.0` unless the machine sets
+/// `versionsort.suffix`, and the fixture's git reads no config but its own.
+fn backfill_around_a_pre_release(per_crate: bool) {
+    if !have_git_cliff() {
+        return;
+    }
+    let f = Fixture::new(if per_crate {
+        "pre-release-per-crate"
+    } else {
+        "pre-release-single"
+    });
+    let (prefix, changelog, source, args): (&str, &str, &str, &[&str]) = if per_crate {
+        f.write(
+            ".config/ship.figl",
+            "name = fixture\nurl = https://github.com/diaryx-org/fixture\nper_crate = true\npublishes = false\n",
+        );
+        f.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"alpha\"]\nresolver = \"2\"\n",
+        );
+        f.write(
+            "alpha/Cargo.toml",
+            "[package]\nname = \"alpha\"\nversion = \"0.9.0\"\nedition = \"2021\"\n",
+        );
+        (
+            "alpha-v",
+            "alpha/CHANGELOG.md",
+            "alpha/src/lib.rs",
+            &["changelog", "--write", "-p", "alpha"],
+        )
+    } else {
+        f.write(
+            ".config/ship.figl",
+            "name = fixture\nurl = https://github.com/diaryx-org/fixture\npublishes = false\n",
+        );
+        f.write(
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.9.0\"\nedition = \"2021\"\n",
+        );
+        (
+            "v",
+            "docs/CHANGELOG.md",
+            "src/lib.rs",
+            &["changelog", "--write"],
+        )
+    };
+    f.write(".gitignore", "target/\n");
+    f.write(changelog, CHANGELOG);
+    let mut body = String::new();
+    for (subject, version) in [
+        ("feat: start", "0.9.0"),
+        ("feat: candidate work", "1.0.0-rc.1"),
+        ("fix: final polish", "1.0.0"),
+        ("fix: a patch", "1.0.1"),
+    ] {
+        body.push_str(&format!("// {subject}\n"));
+        f.write(source, &body);
+        if version == "0.9.0" {
+            f.lockfile();
+        }
+        f.commit(subject);
+        let tag = format!("{prefix}{version}");
+        f.git(&["tag", "-a", &tag, "-m", &tag]);
+    }
+
+    f.ok(args);
+    let log = f.read(changelog);
+    for (tag, has, lacks) in [
+        ("v1.0.1", "a patch", &["final polish", "candidate work"][..]),
+        ("v1.0.0", "final polish", &["candidate work", "a patch"][..]),
+        (
+            "v1.0.0-rc.1",
+            "candidate work",
+            &["final polish", "start"][..],
+        ),
+        ("v0.9.0", "start", &["candidate work"][..]),
+    ] {
+        let section = section(&log, tag);
+        assert!(section.contains(has), "{has} not in\n{section}");
+        for other in lacks {
+            assert!(!section.contains(other), "{other} in\n{section}");
+        }
+    }
+}
+
+#[test]
+fn a_pre_release_backfills_against_the_release_before_it() {
+    backfill_around_a_pre_release(false);
+}
+
+#[test]
+fn a_crates_pre_release_backfills_against_the_release_before_it() {
+    backfill_around_a_pre_release(true);
+}

@@ -1,13 +1,20 @@
 ---
 title: A pre-release backfills against the wrong tag
 description: The changelog backfill takes each missing section's previous tag from git's `v:refname` order, which puts `v1.0.0-rc.1` after `v1.0.0`, so the pre-release's section is empty and the release after it repeats commits the release before it already listed
-status: open
+status: done
 created: 2026-10-29
-updated: 2026-10-29
+updated: 2026-11-03
 part_of: "[Tasks](tasks.md)"
 ---
 
 # A pre-release backfills against the wrong tag
+
+**Status.** Done, in `fix(changelog): a backfilled section starts at the
+tag before it by SemVer`. `missing_sections` sorts the line's tags with
+`version::compare` before it pairs each with its predecessor, and
+`a_pre_release_backfills_against_the_release_before_it` and
+`a_crates_pre_release_backfills_against_the_release_before_it` in
+`tests/fixtures.rs` pin the repro below for both lines.
 
 `missing_sections` in `src/changelog.rs` gives each tag without a section
 the commits between it and the tag before it, and takes "the tag before" as
