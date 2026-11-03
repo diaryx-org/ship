@@ -267,10 +267,15 @@ fn missing_sections(
     text: &str,
 ) -> Result<Vec<String>> {
     let existing: Vec<String> = text.lines().filter_map(section_tag).collect();
-    let all: Vec<String> = version::release_tags(sh, line)?
+    // Each tag's predecessor is the one before it by SemVer, not in git's
+    // `v:refname` list, which puts `v1.0.0-rc.1` after `v1.0.0` on a machine
+    // without `versionsort.suffix`. The sort is stable, so tags naming one
+    // version keep git's order.
+    let mut all: Vec<(String, Version)> = version::release_tags(sh, line)?
         .into_iter()
-        .filter(|t| line.version_of(t).is_some())
+        .filter_map(|t| line.version_of(&t).map(|v| (t, v)))
         .collect();
+    all.sort_by(|a, b| version::compare(&a.1, &b.1));
     // A changelog is allowed a starting point, and the backfill stops there
     // rather than inventing history nobody wrote a changelog for. It is a `v`
     // tag, so it is the starting point of the line with the plain tags.
@@ -281,23 +286,17 @@ fn missing_sections(
         _ => None,
     };
     let mut sections = Vec::new();
-    for (i, tag) in all.iter().enumerate() {
-        let (Some(short), Some(named)) = (line.short(tag), line.version_of(tag)) else {
-            continue;
-        };
+    for (i, (tag, named)) in all.iter().enumerate() {
+        let short = named.tag();
         if existing.contains(&short) {
             continue;
         }
         if let Some(since) = &since
-            && version::compare(&named, since) == Ordering::Less
+            && version::compare(named, since) == Ordering::Less
         {
             continue;
         }
-        let previous = if i == 0 {
-            None
-        } else {
-            Some(all[i - 1].as_str())
-        };
+        let previous = i.checked_sub(1).map(|p| all[p].0.as_str());
         let body = tagged(sh, cliff, line, previous, tag)?;
         let date = sh.capture("git", &["log", "-1", "--format=%cs", tag])?;
         sections.push(format!(
