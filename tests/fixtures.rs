@@ -6,6 +6,7 @@
 //! passes: the unit tests still run, and CI installs it.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -700,4 +701,85 @@ fn a_pre_release_backfills_against_the_release_before_it() {
 #[test]
 fn a_crates_pre_release_backfills_against_the_release_before_it() {
     backfill_around_a_pre_release(true);
+}
+
+/// `ship patch` on a crate that publishes, with a `curl` ahead of the real one
+/// that answers every question with `status`, as crates.io would.
+fn patch_against_a_registry_answering(status: &str) -> (Fixture, Output) {
+    let f = Fixture::new("registry");
+    f.write(".gitignore", "target/\nshim/\n");
+    f.write(
+        ".config/ship.figl",
+        "name = fixture\nurl = https://github.com/diaryx-org/fixture\npublishes = true\nverify = exit 0\n",
+    );
+    f.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    f.write("src/lib.rs", "pub fn a() {}\n");
+    f.write("docs/CHANGELOG.md", CHANGELOG);
+    f.lockfile();
+    f.commit("feat: a crate");
+    f.git(&["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+    f.write("src/lib.rs", "pub fn a() {}\npub fn b() {}\n");
+    f.commit("fix: a fix");
+    f.ok(&["changelog", "--write"]);
+    f.commit("docs: the changelog");
+
+    f.write("shim/curl", &format!("#!/bin/sh\nprintf {status}\n"));
+    let curl = f.root.join("shim/curl");
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(f.root.join("shim"))
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let out = f
+        .command(env!("CARGO_BIN_EXE_ship"))
+        .args(["patch", "--no-verify"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    (f, out)
+}
+
+#[test]
+fn a_200_says_the_version_is_spent() {
+    if !have_git_cliff() {
+        return;
+    }
+    let (f, out) = patch_against_a_registry_answering("200");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("demo-crate 0.1.1 is already on crates.io"),
+        "{stderr}"
+    );
+    assert_eq!(f.tags(), ["v0.1.0"]);
+}
+
+#[test]
+fn only_a_404_says_the_version_is_unspent() {
+    if !have_git_cliff() {
+        return;
+    }
+    let unchecked = "1 crate(s) were not checked for 0.1.1";
+    for (status, warns) in [
+        ("000", true),
+        ("404", false),
+        ("301", true),
+        ("403", true),
+        ("429", true),
+        ("503", true),
+    ] {
+        let (f, out) = patch_against_a_registry_answering(status);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{status}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(f.tags(), ["v0.1.0", "v0.1.1"], "{status}");
+        assert_eq!(stdout.contains(unchecked), warns, "{status}: {stdout}");
+    }
 }

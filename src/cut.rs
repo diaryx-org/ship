@@ -17,9 +17,11 @@ use crate::{Result, bail, cargo, ci};
 const CLIFF_HINT: &str = "nix profile install nixpkgs#git-cliff, or cargo install git-cliff";
 const GH_HINT: &str = "brew install gh, then `gh auth login`";
 
-/// Is this exact version already on crates.io? None where the registry could
-/// not be asked — which is reported as such, not taken as a no. A yanked
-/// version answers 200 too, correctly: a number can never be reused.
+/// Is this exact version already on crates.io? Only a 404 is a no. None where
+/// the registry gave no answer, because it could not be reached or because it
+/// refused or failed the request — which is reported as such, not taken as a
+/// no. A yanked version answers 200 too, correctly: a number can never be
+/// reused.
 fn already_published(sh: &Sh, name: &str, version: &str) -> Option<bool> {
     let code = sh.try_capture(
         "curl",
@@ -35,9 +37,9 @@ fn already_published(sh: &Sh, name: &str, version: &str) -> Option<bool> {
         ],
     );
     match code.trim() {
-        "" | "000" => None,
         "200" => Some(true),
-        _ => Some(false),
+        "404" => Some(false),
+        _ => None,
     }
 }
 
@@ -144,7 +146,7 @@ fn preflight(
     }
     if unasked > 0 {
         println!(
-            "warning: could not reach crates.io; {unasked} crate(s) were not checked for {next}"
+            "warning: crates.io did not answer; {unasked} crate(s) were not checked for {next}"
         );
     }
     if origin == "reachable" {
