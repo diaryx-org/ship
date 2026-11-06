@@ -1,13 +1,22 @@
 ---
 title: A crates.io error reads as unpublished
 description: "`already_published` answers `Some(false)` for every HTTP status but 200, so a 429 or a 503 from crates.io passes preflight as a version nobody has spent, with none of the warning an unreachable registry gets"
-status: open
+status: done
 created: 2026-11-06
 updated: 2026-11-06
 part_of: "[Tasks](tasks.md)"
 ---
 
 # A crates.io error reads as unpublished
+
+**Status.** Done, in `fix(cut): only a 404 from crates.io reads as unpublished`.
+`already_published` takes a 200 as yes and a 404 as no, and every other answer
+as `None`, which preflight counts and warns about. The warning now says
+`crates.io did not answer`, which holds for a registry that was reached and
+refused as well as for one that was not reached.
+`only_a_404_says_the_version_is_unspent` and
+`a_200_says_the_version_is_spent` hold the five rows below, and a 301 and a 403
+besides.
 
 `already_published` in `src/cut.rs` is how preflight asks whether a crate's
 version is spent. Its comment promises three answers: "None where the registry
