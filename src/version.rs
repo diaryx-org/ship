@@ -284,21 +284,64 @@ fn version_in(manifest: &str, config: &Config, line: &Line, place: &str) -> Resu
 /// repository; rewriting by line shape alone repointed it at historica-git's
 /// own version. A dependency renamed by its key is left alone, since the key
 /// is not the package name cargo reports.
-pub fn retarget_path_dep(line: &str, next: &Version, members: Option<&[String]>) -> Option<String> {
+///
+/// The version is a requirement, and its operator moves with it: `=1.0.0`
+/// becomes `=1.1.0`. One this cannot move faithfully, a range or a wildcard,
+/// is an error rather than a rewrite.
+pub fn retarget_path_dep(
+    line: &str,
+    next: &Version,
+    members: Option<&[String]>,
+) -> Result<Option<String>> {
     if !line.contains("path = \"") {
-        return None;
+        return Ok(None);
     }
-    let at = line.find("version = \"")?;
+    let Some(at) = line.find("version = \"") else {
+        return Ok(None);
+    };
     if let Some(members) = members {
         let key = key_name(line.split('=').next().unwrap_or_default().trim());
         if !members.iter().any(|m| m == key) {
-            return None;
+            return Ok(None);
         }
     }
     let start = at + "version = \"".len();
     let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(format!("{}{next}{}", &line[..start], &rest[end..]))
+    let Some(end) = rest.find('"') else {
+        return Ok(None);
+    };
+    let Some(moved) = move_requirement(&rest[..end], next) else {
+        bail!(
+            "cannot move the requirement `{}` to {next} without changing what it allows; \
+             write it as one version, with at most one operator in front:\n  {line}",
+            &rest[..end]
+        );
+    };
+    Ok(Some(format!("{}{moved}{}", &line[..start], &rest[end..])))
+}
+
+/// A requirement with its version replaced and its operator, and any space
+/// after it, kept as written. None for one that is not a single version
+/// behind at most one operator: a range (`>=1.0, <2.0`) or a wildcard (`1.*`).
+fn move_requirement(req: &str, next: &Version) -> Option<String> {
+    let version = req.trim_start_matches(['=', '~', '^', '>', '<']);
+    let operator = &req[..req.len() - version.len()];
+    if !matches!(operator, "" | "=" | "~" | "^" | ">=" | ">" | "<=" | "<") {
+        return None;
+    }
+    let bare = version.trim_start();
+    let space = &version[..version.len() - bare.len()];
+    let plain = !bare.is_empty()
+        && bare
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        && !bare
+            .split(['-', '+'])
+            .next()
+            .unwrap_or_default()
+            .split('.')
+            .any(|p| matches!(p, "x" | "X"));
+    plain.then(|| format!("{operator}{space}{next}"))
 }
 
 /// The name a TOML key spells: `"demo-core"` and `'demo-core'` are
@@ -358,9 +401,12 @@ pub fn rewrite_manifest(
             };
             out.push(retargeted);
             found += 1;
-        } else if let Some(retargeted) =
-            members.and_then(|m| retarget_path_dep(line, next, Some(m)))
-        {
+        } else if let Some(retargeted) = match members {
+            Some(m) => {
+                retarget_path_dep(line, next, Some(m)).map_err(|e| format!("{path}: {e}"))?
+            }
+            None => None,
+        } {
             out.push(retargeted);
             internal += 1;
         } else {
@@ -387,7 +433,7 @@ pub fn retarget_path_deps(
     let mut out = Vec::new();
     let mut internal = 0;
     for line in manifest.lines() {
-        match retarget_path_dep(line, next, Some(members)) {
+        match retarget_path_dep(line, next, Some(members)).map_err(|e| format!("{path}: {e}"))? {
             Some(retargeted) => {
                 out.push(retargeted);
                 internal += 1;
@@ -405,6 +451,17 @@ pub fn retarget_path_deps(
         println!("{path} -> {next} in {internal} internal {noun}");
     }
     Ok(internal)
+}
+
+/// Refuse, before anything is written, a bump that would stop partway at a
+/// pin it cannot move: each manifest, with the members whose pins it moves.
+fn pins_move(sh: &Sh, manifests: &[(String, Vec<String>)], next: &Version) -> Result<()> {
+    for (path, members) in manifests {
+        for line in sh.read(path)?.lines() {
+            retarget_path_dep(line, next, Some(members)).map_err(|e| format!("{path}: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Every file a bump rewrites, for the release commit to stage by name.
@@ -477,6 +534,18 @@ fn write_line(sh: &Sh, config: &Config, line: &Line, next: &Version) -> Result<(
     let Some(table) = line.table else {
         bail!("{} has no table to find its version under", line.name);
     };
+    // The root's own, too: a virtual root is no package, so cargo does not
+    // list it, and `[workspace.dependencies]` is where pins usually sit.
+    let mut manifests = vec![config.manifest.clone()];
+    for w in cargo::workspaces(sh, config)? {
+        manifests.extend(w.manifests.into_iter().filter(|m| m != &config.manifest));
+    }
+    let checked: Vec<_> = manifests
+        .iter()
+        .map(|m| (m.clone(), line.crates.clone()))
+        .collect();
+    pins_move(sh, &checked, next)?;
+
     let text = sh.read(&line.manifest)?;
     let Some(moved) = retarget_in_table(&text, table, next) else {
         bail!(
@@ -486,12 +555,6 @@ fn write_line(sh: &Sh, config: &Config, line: &Line, next: &Version) -> Result<(
     };
     sh.write(&line.manifest, &moved)?;
     println!("{} -> {next}", line.manifest);
-    // The root's own, too: a virtual root is no package, so cargo does not
-    // list it, and `[workspace.dependencies]` is where pins usually sit.
-    let mut manifests = vec![config.manifest.clone()];
-    for w in cargo::workspaces(sh, config)? {
-        manifests.extend(w.manifests.into_iter().filter(|m| m != &config.manifest));
-    }
     for path in &manifests {
         retarget_path_deps(sh, path, next, &line.crates)?;
     }
@@ -512,6 +575,19 @@ fn write_whole(sh: &Sh, config: &Config, next: &Version) -> Result<()> {
     };
 
     let canonical = members_of(&config.manifest);
+    let mut rewritten = vec![config.manifest.clone()];
+    rewritten.extend(config.mirrors.iter().cloned());
+    let mut checked: Vec<_> = rewritten
+        .iter()
+        .filter_map(|m| members_of(m).map(|members| (m.clone(), members)))
+        .collect();
+    for w in &workspaces {
+        for path in w.manifests.iter().filter(|p| !rewritten.contains(p)) {
+            checked.push((path.clone(), w.members.clone()));
+        }
+    }
+    pins_move(sh, &checked, next)?;
+
     rewrite_manifest(
         sh,
         &config.manifest,
@@ -527,8 +603,6 @@ fn write_whole(sh: &Sh, config: &Config, next: &Version) -> Result<()> {
 
     // Then every other manifest in each workspace, for the internal pins
     // declared outside the root's `[workspace.dependencies]`.
-    let mut rewritten = vec![config.manifest.clone()];
-    rewritten.extend(config.mirrors.iter().cloned());
     for w in &workspaces {
         for path in w.manifests.iter().filter(|p| !rewritten.contains(p)) {
             retarget_path_deps(sh, path, next, &w.members)?;
@@ -564,6 +638,10 @@ mod tests {
 
     fn v(a: u64, b: u64, c: u64) -> Version {
         Version::new(a, b, c)
+    }
+    /// A pin this can move, moved or not.
+    fn retarget_path_dep(line: &str, next: &Version, members: Option<&[String]>) -> Option<String> {
+        super::retarget_path_dep(line, next, members).unwrap()
     }
     fn vp(a: u64, b: u64, c: u64, pre: &str) -> Version {
         Version {
@@ -694,6 +772,57 @@ mod tests {
         assert_eq!(
             retarget_path_dep(features, &v(1, 1, 0), None).unwrap(),
             r#"historica = { version = "1.1.0", path = "..", default-features = false, features = ["#
+        );
+    }
+
+    /// A pin is a requirement, and its operator is part of what it says:
+    /// `=1.0.0` moves to `=1.1.0`, not to the caret `1.1.0`.
+    #[test]
+    fn an_operator_stays_with_its_pin() {
+        let pin =
+            |req: &str| format!(r#"demo-macros = {{ path = "../macros", version = "{req}" }}"#);
+        for (from, to) in [
+            ("=1.0.0", "=1.1.0"),
+            ("~1.0.0", "~1.1.0"),
+            ("^1.0.0", "^1.1.0"),
+            (">=1.0.0", ">=1.1.0"),
+            (">1.0.0", ">1.1.0"),
+            ("<=1.0.0", "<=1.1.0"),
+            ("<1.0.0", "<1.1.0"),
+            ("= 1.0.0", "= 1.1.0"),
+            ("1.0", "1.1.0"),
+        ] {
+            assert_eq!(
+                retarget_path_dep(&pin(from), &v(1, 1, 0), None).unwrap(),
+                pin(to),
+                "{from}"
+            );
+        }
+        assert_eq!(
+            retarget_path_dep(&pin("=1.0.0-rc.1"), &vp(1, 0, 0, "rc.2"), None).unwrap(),
+            pin("=1.0.0-rc.2")
+        );
+        for unmovable in [
+            ">=1.0, <2.0",
+            "1.*",
+            "*",
+            "1.x",
+            "=1.X.0",
+            ">=",
+            "=<1.0.0",
+            "",
+        ] {
+            let err = super::retarget_path_dep(&pin(unmovable), &v(1, 1, 0), None).unwrap_err();
+            assert!(
+                err.contains(&format!("`{unmovable}`")),
+                "{unmovable}: {err}"
+            );
+        }
+        // Not a pin this moves, so nothing to refuse.
+        let elsewhere = r#"other = { path = "../other", version = "1.*" }"#;
+        assert_eq!(
+            retarget_path_dep(elsewhere, &v(1, 1, 0), Some(&["demo".to_string()])),
+            None
         );
     }
 

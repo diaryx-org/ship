@@ -1,13 +1,24 @@
 ---
 title: An exact pin loses its operator
 description: A bump moves an internal `{ path, version }` pin by replacing everything between the version string's quotes, so `version = "=1.0.0"` becomes `version = "1.1.0"` — the exact pin turns into a caret requirement, and the crate publishes with a looser requirement than its manifest said
-status: open
+status: done
 created: 2026-11-09
-updated: 2026-11-09
+updated: 2026-11-10
 part_of: "[Tasks](tasks.md)"
 ---
 
 # An exact pin loses its operator
+
+**Status.** Done, in `fix(version): a bump keeps a pin's operator`.
+`retarget_path_dep` moves the version behind a requirement's operator (`=`,
+`~`, `^`, `>=`, `>`, `<=`, `<`) and keeps the operator, and any space after
+it, as written. A requirement that is not one version behind at most one
+operator, such as `>=1.0, <2.0` or `1.*`, is an error, and `write_whole` and
+`write_line` check every pin they would move before they write anything, so
+the bump stops with the tree as it was. `an_operator_stays_with_its_pin`
+beside `retargets_lines` holds each operator and the refusals, and
+`an_exact_pin_stays_exact` in `tests/fixtures.rs` holds the repro below
+through `ship bump`.
 
 `retarget_path_dep` in `src/version.rs` moves an internal pin by finding
 `version = "`, then writing the new version over everything up to the

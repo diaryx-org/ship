@@ -783,3 +783,50 @@ fn only_a_404_says_the_version_is_unspent() {
         assert_eq!(stdout.contains(unchecked), warns, "{status}: {stdout}");
     }
 }
+
+/// A crate released in lockstep with its macros pins them exactly, and a bump
+/// keeps the pin exact. One it cannot move faithfully stops the bump before
+/// anything is written.
+#[test]
+fn an_exact_pin_stays_exact() {
+    let f = Fixture::new("exact-pin");
+    f.write(".gitignore", "target/\n");
+    f.write(
+        ".config/ship.figl",
+        "name = demo\nurl = https://github.com/diaryx-org/demo\n",
+    );
+    f.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/core\", \"crates/macros\"]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[workspace.dependencies]\ndemo-macros = { path = \"crates/macros\", version = \"=1.0.0\" }\n",
+    );
+    f.write(
+        "crates/core/Cargo.toml",
+        "[package]\nname = \"demo-core\"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\ndemo-macros.workspace = true\n",
+    );
+    f.write("crates/core/src/lib.rs", "");
+    f.write(
+        "crates/macros/Cargo.toml",
+        "[package]\nname = \"demo-macros\"\nversion.workspace = true\nedition.workspace = true\n",
+    );
+    f.write("crates/macros/src/lib.rs", "");
+    f.lockfile();
+    f.commit("feat: demo");
+
+    f.ok(&["bump", "1.1.0"]);
+    let root = f.read("Cargo.toml");
+    assert!(
+        root.contains("demo-macros = { path = \"crates/macros\", version = \"=1.1.0\" }"),
+        "{root}"
+    );
+    f.commit("chore: bump to 1.1.0");
+
+    f.write(
+        "crates/core/Cargo.toml",
+        "[package]\nname = \"demo-core\"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\ndemo-macros = { path = \"../macros\", version = \">=1.1, <2\" }\n",
+    );
+    f.lockfile();
+    f.commit("build: a range");
+    let err = f.fails(&["bump", "1.2.0"]);
+    assert!(err.contains("`>=1.1, <2`"), "{err}");
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+}
